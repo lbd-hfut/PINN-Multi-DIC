@@ -1,0 +1,41 @@
+############################################
+# 📂 配置（需要改）
+# 选择匹配方法 sift_match是基于sift匹配法，Integer_pixels是整像素匹配法
+# 划分区域segment，segment=[n1, n2]，高度方向上划分n1份，宽度方向上划分n2份，总共划分n1*n2个区域
+############################################
+
+# method: 选择种子点匹配方法 [Integer_pixels, Sub_pixels]
+Sub_pixels
+
+# seeds_number: 种子点数量
+128
+
+# max_workers: 并行计算线程数
+4
+
+# coarse_subset_radius: 粗搜索子区半径 必须大于 细搜索子区半径 (6~10)pixels
+28
+
+# fine_subset_radius: 细搜索子区半径
+9
+
+# max_iterations: 亚像素搜索迭代次数(尽量不改)
+50
+
+# cutoff_diffnorm: 亚像素搜索迭代ncc收敛迭代阈值(尽量不改)
+1e-5
+
+# lambda_reg: 亚像素搜索迭代雅可比正则化参数(尽量不改)
+1e-3
+
+############################################
+# 是否需要画出种子点匹配的图，方便查看种子点匹配的质量
+# 激活画图功能，设置plot_seed_flage为True
+# 可以通过设置plot_num_image来控制展示前多少幅匹配结果
+############################################
+
+# plot_seed_flage: 是否激活画图功能
+True
+
+# plot_num_image: 展示前几幅图
+10

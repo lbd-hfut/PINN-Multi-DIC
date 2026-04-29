@@ -1,0 +1,82 @@
+############################################
+# 📂 路径配置（需要改）
+# 其中input_dir文件中图像名称长度一致，且按名称顺序排列，
+# 第一张为参考图像，最后一张为参考图像，中间为变形图像
+# 其中output_dir里面存放求解得到的结果文件，每张变形图的结果为“图像名称.mat”文件
+############################################
+
+# input_dir: 输入图像所在的文件夹路径
+./case/2D/ring
+
+# output_dir: 结果输出文件夹路径
+./case/2D/ring/results
+
+############################################
+# 🧠 网络结构参数（一般偶尔改）
+# 其中hidden_units为PINN-DIC隐藏层神经元数目列表，控制网络宽度。
+# 其中scale_networks为多尺度网络比例，用于改进收敛性和精度。
+# 例如scale_networks=[1,4,8,16]表示使用4个网络，分别对输入x乘以4个系数。
+# 其中activation为激活函数名称（tanh/relu/sigmoid/leaky_relu/softplus/SiLU/sin），决定非线性表达能力。
+############################################
+
+# n_subdomains: 区域分割
+[2, 2]
+
+# train_schedulers: 训练方式 ["AllActiveSchedulerND", "PointSchedulerRectangularND", "LineSchedulerRectangularND"]
+AllActiveSchedulerND
+
+# hidden_units: PINN-DIC神经元数目列表
+[32,32,32,32]
+
+# network: 神经网络 ["FCN", "AdaptiveFCN", "SIREN", "AdaptiveSIREN", "ResNet", "AdaptiveResNet"， "FourierNet"]
+AdaptiveFCN
+
+# spline_degree: 插值方法 [1, 3, 5]
+5
+
+# loss_fun: 损失函数的选择 ["DIC_MSE", "DIC_ZNSSD"]
+DIC_ZNSSD
+
+############################################
+# 🏋️‍♂️ 训练参数（常调整）
+############################################
+
+# adam_epochs: Adam轮数
+100
+
+# seed_flag: 判断是否使用种子点，使用的话请配置“Seed_Configuration.txt”
+True
+
+# seed_train_epochs: 种子点预训练轮数（不训练种子点提供网络输出的尺度系数）
+0
+
+############################################
+# ⚙️ 优化器细节参数（很少改）
+############################################
+
+# adam_lr: Adam预热学习率
+0.01
+
+# adam_betas: Adam动量参数(beta1, beta2)
+[0.9, 0.999]
+
+# adam_decay: Adam权重衰减
+0.0
+
+# summary_freq: 打印求解loss频率
+10
+
+# test_freq: 打印测试loss频率
+1000
+
+# model_save_freq: 模型保存频率
+10000
+
+# show_figures: 画出结果图
+False
+
+# save_figures: 保存图像
+True
+
+# clear_output: 是否定期清除 IPython 输出
+False

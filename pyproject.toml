@@ -1,0 +1,40 @@
+[project]
+name = "pinndicmulti"
+version = "0.1.0"
+
+description = "PINN-Multi-DIC: physics-informed multi-camera digital image correlation framework"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Boda Li" },
+]
+
+requires-python = ">=3.10"
+
+keywords = ["dic", "pinn", "digital-image-correlation", "physics-informed", "multi-camera", "3d"]
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Natural Language :: English",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Image Processing",
+  "Intended Audience :: Science/Research",
+  "Development Status :: 3 - Alpha",
+]
+
+[project.urls]
+Homepage = "https://github.com/lbd-hfut/PINN-Multi-DIC"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pinndicmulti"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "pinndicmulti",
+  "LICENSE",
+  "README.md"
+]

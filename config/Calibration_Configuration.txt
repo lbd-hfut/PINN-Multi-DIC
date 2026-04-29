@@ -1,0 +1,23 @@
+############################################
+# 📂 路径配置（需要改）
+# 其中calibrate1_dir和calibrate2_dir文件中图像名称长度一致，且按名称顺序排列，
+# 其中calibrate1_dir和calibrate2_dir文件中第一张为参考图像，其余为变形图像
+############################################
+
+# calibrate1_dir: 相机1棋盘格/圆点阵图像文件夹路径
+./case/3D/plate_center_load/calibrate1
+
+# calibrate2_dir: 相机2棋盘格/圆点阵图像文件夹路径
+./case/3D/plate_center_load/calibrate2
+
+# pattern_type: chessboard 代表棋盘格 or circles 代表原点阵
+chessboard
+
+# pattern_size: 棋盘格和圆点阵的分布(w_number, h_number)半角标
+(11, 8)
+
+# length: 棋盘格中代表一个方格的长度，圆点阵中代表原点的圆点之间的距离，单位mm
+5
+
+# visualize: 是否展示特征点的匹配图像（True，False）
+True
