@@ -15,7 +15,7 @@ from pinndicmulti.segpinndic.DIC_plot_trainer import result_uv_plot, result_uvw_
 
 def main(
     seed_config_path="./config/Seed_Configuration.txt",
-    dic_config_path="./config/PINN-DIC-3D.txt",
+    dic_config_path="./config/PINN-DIC-Mutil3D.txt",
     calibrate_config_path="./config/Calibration_Configuration.txt"
     ):
     
