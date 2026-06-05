@@ -212,10 +212,54 @@ def zero_to_nan(matrix):
     return matrix
 
 def _nonzero_minmax(arr):
+    arr = np.asarray(arr, dtype=float)
     arr_nz = arr[arr != 0]
+    arr_nz = arr_nz[~np.isnan(arr_nz)]
     if arr_nz.size == 0:
         return None, None
     return np.min(arr_nz), np.max(arr_nz)
+
+
+def plot_seed_prediction(u_roi, v_roi, mask, save_dir, label):
+    """Plot predicted u, v displacement fields after seed training.
+
+    Args:
+        u_roi: (N,) u displacement at ROI points
+        v_roi: (N,) v displacement at ROI points
+        mask: (H, W) boolean ROI mask
+        save_dir: base figure output directory (e.g. c.fig_out_dir)
+        label: filename label (e.g. "pinn_roi0_pair1")
+    """
+    u_roi = np.array(u_roi)
+    v_roi = np.array(v_roi)
+
+    u_img = np.full(mask.shape, np.nan, dtype=np.float32)
+    v_img = np.full(mask.shape, np.nan, dtype=np.float32)
+    ys, xs = np.where(mask)
+    u_img[ys, xs] = u_roi
+    v_img[ys, xs] = v_roi
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5), dpi=150)
+
+    im1 = ax1.imshow(u_img, cmap='jet', interpolation='nearest')
+    ax1.set_title("u (seed prediction)", fontsize=10)
+    ax1.axis('off')
+    plt.colorbar(im1, ax=ax1)
+
+    im2 = ax2.imshow(v_img, cmap='jet', interpolation='nearest')
+    ax2.set_title("v (seed prediction)", fontsize=10)
+    ax2.axis('off')
+    plt.colorbar(im2, ax=ax2)
+
+    plt.tight_layout()
+
+    seed_dir = os.path.join(save_dir, "seed")
+    if not os.path.exists(seed_dir):
+        os.makedirs(seed_dir)
+    file_path = os.path.join(seed_dir, f"seed_{label}.png")
+    fig.savefig(file_path, bbox_inches='tight')
+    logger.info(f"Seed prediction saved to {file_path}")
+    plt.close(fig)
 
 
 def result_uv_strain_plot(u, v, exx, exy, eyy,
@@ -410,22 +454,12 @@ def result_xyz_plot(X, Y, Z,
     elev, azim : view angle
     """
 
-    # ===== helper =====
-    def zero_to_nan(arr):
-        arr = arr.astype(float)
-        arr[arr == 0] = np.nan
-        return arr
-
-    def nonzero_minmax(arr):
-        valid = arr[arr != 0]
-        return valid.min(), valid.max()
-
     # ===== 处理数据 =====
-    z_min, z_max = nonzero_minmax(Z)
+    z_min, z_max = np.nanmin(Z), np.nanmax(Z)
 
-    X = zero_to_nan(X)
-    Y = zero_to_nan(Y)
-    Z = zero_to_nan(Z)
+    X = X.astype(float)
+    Y = Y.astype(float)
+    Z = Z.astype(float)
 
     # ===== figure =====
     fig = plt.figure(figsize=(WH[1], WH[0]), dpi=200)
@@ -469,5 +503,116 @@ def result_xyz_plot(X, Y, Z,
         file_path = os.path.join(save_dir, filename)
         plt.savefig(file_path, bbox_inches='tight')
         print(f"Saved to {file_path}")
+
+
+def result_3d_displacement_surface(X, Y, Z, U, V, W,
+                                   WH=[5, 4],
+                                   elev=30, azim=-60,
+                                   save_dir=None, filename=None):
+    """3D deformed surface colored by total displacement magnitude.
+
+    Plots the deformed 3D surface (X, Y, Z) with face colors mapped to
+    the total displacement sqrt(U²+V²+W²). NaN-safe.
+
+    Parameters
+    ----------
+    X, Y, Z : 2D array
+        Deformed 3D coordinates (from triangulation).
+    U, V, W : 2D array
+        3D displacement components.
+    WH : list
+        Figure size scaling [height, width].
+    elev, azim : float
+        View angle (elevation, azimuth).
+    save_dir : str
+        Output directory (e.g. fig_3d_dir).
+    filename : str
+        Output filename (e.g. "surface_frame_001.png").
+    """
+    # --- Compute total displacement magnitude ---
+    U_flat = U.ravel()
+    V_flat = V.ravel()
+    W_flat = W.ravel()
+    disp_mag = np.sqrt(U_flat**2 + V_flat**2 + W_flat**2)
+    D = disp_mag.reshape(U.shape)
+
+    d_min = np.nanmin(D)
+    d_max = np.nanmax(D)
+    if not np.isfinite(d_min):
+        d_min, d_max = 0.0, 1.0
+
+    Xf = X.astype(float)
+    Yf = Y.astype(float)
+    Zf = Z.astype(float)
+
+    # --- Figure ---
+    fig = plt.figure(figsize=(WH[1], WH[0]), dpi=200)
+    ax = fig.add_subplot(111, projection='3d')
+
+    norm = matplotlib.colors.Normalize(vmin=d_min, vmax=d_max)
+    cmap = plt.get_cmap('jet')
+
+    surf = ax.plot_surface(
+        Xf, Yf, Zf,
+        facecolors=cmap(norm(D)),
+        rstride=1, cstride=1,
+        linewidth=0, antialiased=False, shade=False,
+    )
+
+    mappable = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array([])
+    cbar = fig.colorbar(mappable, ax=ax, shrink=0.6)
+    cbar.set_label("|Displacement| (mm)", fontsize=8)
+
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_title("3D Deformed Surface", fontsize=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+
+    # --- Save ---
+    if save_dir is not None:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        file_path = os.path.join(save_dir, filename)
+        plt.savefig(file_path, bbox_inches='tight')
+        logger.info(f"3D displacement surface saved to {file_path}")
+        plt.close(fig)
+
+
+def result_3d_deformation_plot(U, V, W, exx, eyy, ezz, exy, exz, eyz,
+                                save_dir=None, filename=None):
+    """3x3 grid plot of 3D deformation (displacement + strain).
+
+    Layout:
+        U    V    W
+       exx  eyy  ezz
+       exy  exz  eyz
+    """
+    fig, axes = plt.subplots(3, 3, figsize=(14, 12), dpi=150)
+
+    titles = ["U", "V", "W", "exx", "eyy", "ezz", "exy", "exz", "eyz"]
+    data = [U, V, W, exx, eyy, ezz, exy, exz, eyz]
+
+    for ax, title, d in zip(axes.flat, titles, data):
+        d_nan = np.where(np.abs(d) < 1e-30, np.nan, d)
+        im = ax.imshow(d_nan, cmap='jet', interpolation='nearest')
+        ax.set_title(title, fontsize=9)
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    plt.suptitle("3D Deformation", fontsize=12, y=1.01)
+    plt.tight_layout()
+
+    if save_dir is not None and filename is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        file_path = os.path.join(save_dir, filename)
+        fig.savefig(file_path, bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        logger.info(f"Deformation plot saved to {file_path}")
+    elif save_dir is not None:
+        return fig
+    else:
+        plt.close(fig)
 
     plt.close()

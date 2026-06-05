@@ -22,62 +22,35 @@ class ConstantsBase:
     # calculated variables
     @property
     def summary_out_dir(self):
-        return f"{self.reslut_dir}/summaries/{self.run}/"
+        return f"{self.work_dir}/summaries/{self.run}/"
     @property
     def model_out_dir(self):
-        return f"{self.reslut_dir}/models/{self.run}/"
+        return f"{self.work_dir}/models/{self.run}/"
     @property
-    def mat_out_dir(self):
-        return f"{self.reslut_dir}/mats/{self.run}/"
+    def calib_out_dir(self):
+        return f"{self.work_dir}/calibration/"
+    @property
+    def reconstruct_out_dir(self):
+        return f"{self.work_dir}/reconstruct/"
+    @property
+    def deformation_out_dir(self):
+        return f"{self.work_dir}/deformation/"
     @property
     def fig_out_dir(self):
-        return f"{self.reslut_dir}/figs/{self.run}/"
-    @property
-    def mat_disparity_out_dir(self):
-        return f"{self.reslut_dir}/mats/disparity/{self.run}/"
-    @property
-    def fig_disparity_out_dir(self):
-        return f"{self.reslut_dir}/figs/disparity/{self.run}/"
-    @property
-    def mat_temporal_out_dir(self):
-        return f"{self.reslut_dir}/mats/temporal/{self.run}/"
-    @property
-    def fig_temporal_out_dir(self):
-        return f"{self.reslut_dir}/figs/temporal/{self.run}/"
-    @property
-    def mat_3D_out_dir(self):
-        return f"{self.reslut_dir}/mats/3D/{self.run}/"
-    @property
-    def fig_3D_out_dir(self):
-        return f"{self.reslut_dir}/figs/3D/{self.run}/"
+        return f"{self.work_dir}/figs/{self.run}/"
 
-    def get_outdirs(self,dim=2):
+    def get_outdirs(self):
         io.get_dir(self.summary_out_dir)
         io.get_dir(self.model_out_dir)
-        if dim == 2:
-            io.get_dir(self.mat_out_dir)
-            io.get_dir(self.fig_out_dir)
-        elif dim == 3:
-            io.get_dir(self.mat_disparity_out_dir)
-            io.get_dir(self.fig_disparity_out_dir)
-            io.get_dir(self.mat_temporal_out_dir)
-            io.get_dir(self.fig_temporal_out_dir)
-            io.get_dir(self.mat_3D_out_dir)
-            io.get_dir(self.fig_3D_out_dir)
-        
-    def clear_outdirs(self,dim=2):
+        io.get_dir(self.calib_out_dir)
+        io.get_dir(self.reconstruct_out_dir)
+        io.get_dir(self.deformation_out_dir)
+        io.get_dir(self.fig_out_dir)
+
+    def clear_outdirs(self):
         io.clear_dir(self.summary_out_dir)
         io.clear_dir(self.model_out_dir)
-        if dim == 2:
-            io.clear_dir(self.mat_out_dir)
-            io.clear_dir(self.fig_out_dir)
-        elif dim == 3:
-            io.clear_dir(self.mat_disparity_out_dir)
-            io.clear_dir(self.fig_disparity_out_dir)
-            io.clear_dir(self.mat_temporal_out_dir)
-            io.clear_dir(self.fig_temporal_out_dir)
-            io.clear_dir(self.mat_3D_out_dir)
-            io.clear_dir(self.fig_3D_out_dir)
+        io.clear_dir(self.fig_out_dir)
 
     def save_constants_file(self):
         "Save a constants to file in self.summary_out_dir"
@@ -98,10 +71,11 @@ class Constants(ConstantsBase):
         "Defines global constants for model"
 
         # Define results directories
-        self.reslut_dir = DICconfig.output_dir
+        self.work_dir = DICconfig.work_dir
         
         # image shape
         self.roi_id = roi_id
+        self.pair_idx = 0  # updated per DIC pair by the pipeline
         roi = BufferManager.mask[roi_id]
         roi = np.asarray(roi)
         assert roi.ndim == 2, "ROI must be (H, W) bool array"
@@ -135,7 +109,7 @@ class Constants(ConstantsBase):
             QKBQKT_def = None,
             mask = None,
             degree = 5,
-            znssd_kernel_size = 7,
+            znssd_kernel_size = getattr(DICconfig, "znssd_kernel_size", 7),
         )
 
         # Define domain decomposition
@@ -145,7 +119,7 @@ class Constants(ConstantsBase):
                 np.linspace(xmin_roi, xmax_roi, 5), 
                 np.linspace(ymin_roi, ymax_roi, 5)
                 ]
-            self.subdomain_ws = get_subdomain_ws(self.subdomain_xs, 1.6)
+            self.subdomain_ws = get_subdomain_ws(self.subdomain_xs, 2.4)
         else:
             nodes_xs = [
                 np.linspace(xmin_roi, xmax_roi, nx+1), 
@@ -205,15 +179,32 @@ class Constants(ConstantsBase):
         # Define optimisation parameters
         self.ns = ((1,),)# batch_shape for placeholder
         self.n_test = (200,)# batch_shape for test data
+        self.seed_lr = getattr(DICconfig, "adam_lr", 1e-3)
+        self.dic_lr = getattr(DICconfig, "dic_lr", self.seed_lr)
         self.optimiser = optax.adam
         self.optimiser_kwargs = dict(
-            learning_rate=getattr(DICconfig, "adam_lr", 1e-3)
+            learning_rate=self.dic_lr
             )
         self.seed = seed
+
+        # L-BFGS refinement parameters
+        self.lbfgs_epochs = getattr(DICconfig, "lbfgs_epochs", 0)
+        self.lbfgs_history_size = getattr(DICconfig, "lbfgs_history_size", 10)
+        self.lbfgs_maxls = getattr(DICconfig, "lbfgs_maxls", 15)
+        self.lbfgs_lr = getattr(DICconfig, "lbfgs_lr", 1.0)
+
+        # seed supervised pre-training
+        self.seed_pos = None        # (N,2) seed point coordinates
+        self.seed_uv = None         # (N,2) seed point displacements
+        self.seed_train_epochs = getattr(DICconfig, "seed_train_epochs", 0)  # number of seed pre-training steps
+        self.seed_smooth_lambda = getattr(DICconfig, "seed_smooth_lambda", 0.0)    # gradient-norm penalty weight
+        self.seed_smooth_npoints = getattr(DICconfig, "seed_smooth_npoints", 0)    # collocation points for smoothness
+        self.seed_sd_threshold = getattr(DICconfig, "seed_sd_threshold", 5.0)      # min sd (pixels) to enable seed training
 
         # Define summary output parameters
         self.summary_freq = getattr(DICconfig, "summary_freq", 1000)        # outputs train stats to command line
         self.test_freq = getattr(DICconfig, "test_freq", 1000)              # outputs test stats to plot / file / command line
+        self.test_flag = getattr(DICconfig, "test_flag", False)              # whether to print test information
         self.model_save_freq = getattr(DICconfig, "model_save_freq", 10000)
         self.show_figures = getattr(DICconfig, "show_figures", False)       # whether to show figures
         self.save_figures = getattr(DICconfig, "save_figures", True)        # whether to save figures

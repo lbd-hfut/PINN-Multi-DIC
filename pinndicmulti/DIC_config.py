@@ -134,8 +134,11 @@ ALL_KEYS_2D = [
     "input_dir", "output_dir", "n_subdomains",
     "hidden_units", "network", "spline_degree",
     "adam_epochs", "seed_flag", "seed_train_epochs",
-    "adam_lr", "summary_freq", "test_freq", "model_save_freq",
-     "show_figures",  "save_figures",  "clear_output"
+    "adam_lr", "dic_lr", "summary_freq", "test_freq", "test_flag", "model_save_freq",
+     "show_figures",  "save_figures",  "clear_output",
+     "loss_fun", "train_schedulers", "znssd_kernel_size",
+     "lbfgs_epochs", "lbfgs_history_size", "lbfgs_maxls", "lbfgs_lr",
+     "seed_smooth_lambda", "seed_smooth_npoints", "seed_sd_threshold"
 ]
 # ============================================
 # 读取DIC配置文件
@@ -202,12 +205,35 @@ def DIC_2D_config_txt(path, required_keys=ALL_KEYS_2D, verbose=True):
 
 
 ALL_KEYS_3D = [
-    "cam1_dir", "cam2_dir", "roi_path", "calibration_path",
-    "output_dir", "adam_epochs", "strain_window_len", "seed_flag", "seed_train_epochs",
+    "work_dir", "mask_path", "mask_camera",
+    "adam_epochs", "strain_window_len", "seed_flag", "seed_train_epochs",
     "n_subdomains", "train_schedulers", "hidden_units", "network", "spline_degree", "loss_fun",
     "adam_lr", "summary_freq", "test_freq", "model_save_freq",
-     "show_figures",  "save_figures",  "clear_output"
+     "show_figures",  "save_figures",  "clear_output",
+     "dic_lr", "test_flag", "znssd_kernel_size",
+     "lbfgs_epochs", "lbfgs_history_size", "lbfgs_maxls", "lbfgs_lr",
+     "seed_smooth_lambda", "seed_smooth_npoints", "seed_sd_threshold"
 ]
+
+def get_work_subdir(work_dir, subdir):
+    """Return path to a standard work subdirectory."""
+    return os.path.join(work_dir, subdir)
+
+def discover_cameras(work_dir):
+    """Discover camera folders under work_dir/images/.
+
+    Returns sorted list of folder names like ['cam1', 'cam2', ...].
+    """
+    images_dir = get_work_subdir(work_dir, "images")
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+    cam_dirs = sorted([
+        d for d in os.listdir(images_dir)
+        if os.path.isdir(os.path.join(images_dir, d))
+    ])
+    if not cam_dirs:
+        raise FileNotFoundError(f"No camera folders found under {images_dir}")
+    return cam_dirs
 # ============================================
 # 读取DIC配置文件
 # ============================================

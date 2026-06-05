@@ -1,93 +1,111 @@
 ############################################
-# 📂 路径配置（需要改）
-# 其中cam1_dir和cam2_dir文件中图像名称长度一致，且按名称顺序排列，
-# 其中cam1_dir和cam2_dir文件中第一张为参考图像，其余为变形图像
-# 注意roi_path是roi_img的图像路径，不要放到cam1_dir和cam2_dir里
-# 注意calibration_path是matlab工具箱标定结果的文件路径
-# 其中output_dir里面存放求解得到的结果文件，每张变形图的结果为“图像名称.mat”文件
+#  工作路径与数据（需要改）
+#  相机图像放在 work_dir/images/cam*/
+#  每台相机的第一张图 = 参考图像 + COLMAP 标定输入
 ############################################
 
-# cam1_dir: 相机1拍摄的图像所在的文件夹路径
-./case/3D/plate_center_load/cam1
+# work_dir: 工作路径（包含 images/ 子目录）
+./case/Rubber_drum
 
-# cam2_dir: 相机2拍摄的图像所在的文件夹路径
-./case/3D/plate_center_load/cam2
+# mask_path: ROI 掩膜图像路径
+./case/Rubber_drum/images/mask.bmp
 
-# roi_path: 人工指定的roi图像的文件路径
-./case/3D/plate_center_load/ROI.bmp
-
-# calibration_path: 设定标定结果文件输出路径
-./case/3D/plate_center_load/calibrationSession.mat
-
-# output_dir: 结果输出文件夹路径
-./case/3D/plate_center_load/results
+# mask_camera: mask 对应哪台相机的参考图像（填 images/ 下的文件夹名）
+3
 
 ############################################
-# 🏋️‍♂️ 训练参数（常调整）
+#  训练参数（常调整）
 ############################################
 
-# adam_epochs: Adam轮数
+# adam_epochs: Adam 训练轮数
 200
 
-# strain_window_len: 计算应变窗口长度
+# strain_window_len: 3D 应变计算窗口长度
 15
 
-# seed_flag: 判断是否使用种子点，使用的话请配置“Seed_Configuration.txt”
+# seed_flag: 是否使用种子点预匹配
 True
 
-# seed_train_epochs: 种子点预训练轮数（不训练种子点提供网络输出的尺度系数）
-0
+# seed_train_epochs: 种子点预训练轮数（0=跳过）
+2000
 
 ############################################
-# 🧠 网络结构参数（一般偶尔改）
-# 其中hidden_units为PINN-DIC隐藏层神经元数目列表，控制网络宽度。
+#  网络结构（偶尔改）
 ############################################
 
-# n_subdomains: 区域分割
+# n_subdomains: FBPINN 子域分割 [nx, ny]
 [1, 1]
 
-# train_schedulers: 训练方式 ["AllActiveSchedulerND", "PointSchedulerRectangularND", "LineSchedulerRectangularND"]
+# train_schedulers: 子域激活策略
 AllActiveSchedulerND
 
-# hidden_units: PINN-DIC神经元数目列表
-[32,32,32,32,32]
+# hidden_units: PINN 隐藏层神经元数
+[32, 32, 32, 32, 32]
 
-# network: 神经网络 ["FCN", "AdaptiveFCN", "SIREN", "AdaptiveSIREN", "ResNet", "AdaptiveResNet"， "FourierNet"]
+# network: 网络架构
 AdaptiveFCN
 
-# spline_degree: 插值方法 [1, 3, 5]
+# spline_degree: B-spline 插值阶数 [1, 3, 5]
 5
 
-# loss_fun: 损失函数的选择 ["DIC_MSE", "DIC_ZNSSD"]
-DIC_MSE
+# loss_fun: 损失函数(DIC_ZNSSD/DIC_MSE)
+DIC_ZNSSD
+
+# znssd_kernel_size: ZNSSD 核窗口大小（仅 DIC_ZNSSD 有效）
+7
 
 ############################################
-# ⚙️ 优化器细节参数（很少改）
+#  优化器参数（很少改）
 ############################################
 
-# adam_lr: Adam预热学习率
+# adam_lr: Adam 学习率
 0.01
 
-# adam_betas: Adam动量参数(beta1, beta2)
-[0.9, 0.999]
+# dic_lr: DIC 阶段学习率
+0.01
 
-# adam_decay: Adam权重衰减
-0.0
+# lbfgs_epochs: L-BFGS 精化步数（0=跳过）
+0
 
-# summary_freq: 打印求解loss频率
+# lbfgs_history_size: L-BFGS 历史长度
 10
 
-# test_freq: 打印测试loss频率
+# lbfgs_maxls: L-BFGS 最大线搜索
+15
+
+# lbfgs_lr: L-BFGS 步长
+1.0
+
+# summary_freq: 打印 loss 频率（epoch）
+10
+
+# test_freq: 测试指标频率（epoch）
 1000
 
-# model_save_freq: 模型保存频率
+# test_flag: 是否输出测试指标
+False
+
+# model_save_freq: 模型保存频率（epoch）
 10000
 
-# show_figures: 画出结果图
+# seed_smooth_lambda: 种子预训练平滑正则化权重
+0.0
+
+# seed_smooth_npoints: 平滑配点数量
+0
+
+# seed_sd_threshold: 种子位移半范围阈值(pixel)，任一方向超过此值才启用种子预训练
+5.0
+
+############################################
+#  输出控制
+############################################
+
+# show_figures: 显示图像
 False
 
 # save_figures: 保存图像
 True
 
-# clear_output: 是否定期清除 IPython 输出
+# clear_output: 定期清除 IPython 输出
 False

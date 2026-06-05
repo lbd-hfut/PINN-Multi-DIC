@@ -118,6 +118,119 @@ def triangulation(config, Xrerf, Utemporal, Udisparity):
     pts3D = reconstruct_mode(pts2DL, pts2DR, P1, P2, K1, K2, dist1, dist2)
     return pts3D
 
+
+# ==============================
+# Multi-camera triangulation
+# ==============================
+
+def triangulate_pair(K_i, K_j, dist_i, dist_j, R_i, t_i, R_j, t_j, pts2D_i, pts2D_j):
+    """Triangulate 3D points from a camera pair using COLMAP parameters.
+
+    Parameters
+    ----------
+    K_i, K_j : ndarray (3,3)
+        Intrinsic matrices for camera i and j.
+    dist_i, dist_j : ndarray (5,)
+        Distortion coefficients.
+    R_i, t_i : ndarray (3,3), (3,1)
+        Camera i rotation and translation (cam_from_world).
+    R_j, t_j : ndarray (3,3), (3,1)
+        Camera j rotation and translation (cam_from_world).
+    pts2D_i, pts2D_j : ndarray (N,2)
+        Matched 2D points in camera i and j.
+
+    Returns
+    -------
+    pts3D : ndarray (N,3)
+        Triangulated 3D points in world coordinates.
+    """
+    pts2D_i = pts2D_i.astype(np.float64)
+    pts2D_j = pts2D_j.astype(np.float64)
+
+    # Ensure numeric types (calib may use object arrays for storage)
+    K_i = np.asarray(K_i, dtype=np.float64)
+    K_j = np.asarray(K_j, dtype=np.float64)
+    dist_i = np.asarray(dist_i, dtype=np.float64)
+    dist_j = np.asarray(dist_j, dtype=np.float64)
+    R_i = np.asarray(R_i, dtype=np.float64)
+    t_i = np.asarray(t_i, dtype=np.float64)
+    R_j = np.asarray(R_j, dtype=np.float64)
+    t_j = np.asarray(t_j, dtype=np.float64)
+
+    # Build projection matrices P = K [R | t]
+    Rt_i = np.hstack((R_i, t_i))
+    Rt_j = np.hstack((R_j, t_j))
+    P_i = K_i @ Rt_i
+    P_j = K_j @ Rt_j
+
+    # Undistort points
+    pts_i = pts2D_i.reshape(-1, 1, 2).astype(np.float64)
+    pts_j = pts2D_j.reshape(-1, 1, 2).astype(np.float64)
+    pts_i_undist = cv2.undistortPoints(pts_i, K_i, dist_i, P=K_i).reshape(-1, 2)
+    pts_j_undist = cv2.undistortPoints(pts_j, K_j, dist_j, P=K_j).reshape(-1, 2)
+
+    # Triangulate
+    pts4D = cv2.triangulatePoints(P_i, P_j, pts_i_undist.T, pts_j_undist.T)
+    pts3D = (pts4D[:3] / pts4D[3]).T
+
+    return pts3D
+
+
+def triangulate_all_pairs(calib, matched_pts_per_camera, roi_coords):
+    """Triangulate 3D points from all camera pairs and return merged cloud.
+
+    Uses camera 0 as reference. For each pair (0, j), triangulates
+    the matched points, then transforms all results to the world frame.
+
+    Parameters
+    ----------
+    calib : dict
+        Calibration dict with keys: K_list, dist_list, cam_from_world_R,
+        cam_from_world_t, num_cameras.
+    matched_pts_per_camera : dict
+        dict[cam_idx] = ndarray (N, 2) — matched 2D points in each camera.
+        Points are in pixel coordinates relative to camera 0's reference image.
+    roi_coords : ndarray (N, 2)
+        Reference pixel coordinates in camera 0 (x, y).
+
+    Returns
+    -------
+    pts3D_merged : ndarray (N, 3)
+        Fused 3D point cloud in world coordinates.
+    """
+    num_cameras = calib["num_cameras"]
+    K_list = calib["K_list"]
+    dist_list = calib["dist_list"]
+    R_list = calib["cam_from_world_R"]
+    t_list = calib["cam_from_world_t"]
+
+    pts3D_all = []
+
+    # Camera 0 is the primary reference
+    # For each camera pair (0, j), triangulate
+    pts2D_0 = matched_pts_per_camera[0]  # points in camera 0
+
+    for j in range(1, num_cameras):
+        pts2D_j = matched_pts_per_camera[j]
+
+        pts3D = triangulate_pair(
+            K_list[0], K_list[j],
+            dist_list[0], dist_list[j],
+            R_list[0], t_list[0],
+            R_list[j], t_list[j],
+            pts2D_0, pts2D_j
+        )
+        pts3D_all.append(pts3D)
+
+    # Simple fusion: average all pairwise reconstructions
+    if len(pts3D_all) == 1:
+        return pts3D_all[0]
+
+    pts3D_stacked = np.stack(pts3D_all, axis=0)  # (num_pairs, N, 3)
+    pts3D_merged = np.mean(pts3D_stacked, axis=0)
+    return pts3D_merged
+
+
 if __name__ == "__main__":
     mat_path = 'C:/01project/PINN-3D-DIC/case/3D/plate_center_load/calibrationSession.mat'
     load_stereo_params(mat_path)

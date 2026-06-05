@@ -15,6 +15,7 @@ import tqdm
 import shutil
 import pickle
 import optax
+import jaxopt
 import socket
 from pathlib import Path
 from jax import random, jit, vmap, value_and_grad, jvp
@@ -58,3 +59,4 @@ def seed_everything(seed_value: int):
 
 seed = 42
 seed_everything(seed)
+jax.clear_caches()

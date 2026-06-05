@@ -1,4 +1,4 @@
-from pinndicmulti.DIC_importlib import os, time, pickle, jax, jnp, np, plt, SummaryWriter, \
+from pinndicmulti.DIC_importlib import os, time, pickle, jax, jaxopt, jnp, np, plt, SummaryWriter, \
     jit, vmap, value_and_grad, jvp, partial, random, optax
 import IPython.display
 
@@ -33,6 +33,40 @@ class _Trainer:
                 ))
         self.writer.add_scalar("loss/train", loss, i)
         self.writer.add_scalar("stats/rate", rate, i)
+
+    def _print_test(
+        self,
+        i,
+        loss,
+        disp_leff,
+        strain_leff,
+        disp_rms,
+        strain_rms
+    ):
+        logger.info(
+            "[TEST i: %i/%i] "
+            "loss: %.6f | "
+            "disp_leff: %.4f | "
+            "strain_leff: %.4f | "
+            "disp_rms: %.6e | "
+            "strain_rms: %.6e | %s"
+            % (
+                i,
+                self.c.n_steps,
+                loss,
+                disp_leff,
+                strain_leff,
+                disp_rms,
+                strain_rms,
+                self.c.run,
+            )
+        )
+
+        self.writer.add_scalar("test/loss", loss, i)
+        self.writer.add_scalar("test/disp_leff", disp_leff, i)
+        self.writer.add_scalar("test/strain_leff", strain_leff, i)
+        self.writer.add_scalar("test/disp_rms", disp_rms, i)
+        self.writer.add_scalar("test/strain_rms", strain_rms, i)
 
     def _save_figs(self, i, fs):
         "Saves figures"
@@ -147,7 +181,7 @@ def FBPINN_model_inner(params, x, norm_fn, network_fn, unnorm_fn, window_fn):
     u_raw = network_fn(params, x_norm)# network
     u = unnorm_fn(params, u_raw)# unnormalise
     w = window_fn(params, x)# window
-    return u*w, w, u_raw
+    return u*w, w, u_raw, u
 
 def PINN_model_inner(all_params, x, norm_fn, network_fn, unnorm_fn):
     x_norm = norm_fn(all_params, x)# normalise
@@ -191,7 +225,7 @@ def FBPINN_model(all_params, x_batch, takes, model_fns, verbose=True):
     logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), all_params_take))
 
     # batch over parameters and points
-    us, ws, us_raw = vmap(FBPINN_model_inner, in_axes=(f,0,None,None,None,None))(all_params_take, x_take, norm_fn, network_fn, unnorm_fn, window_fn)# (s, ud)
+    us, ws, us_raw, us_u = vmap(FBPINN_model_inner, in_axes=(f,0,None,None,None,None))(all_params_take, x_take, norm_fn, network_fn, unnorm_fn, window_fn)# (s, ud)
 
     # apply POU and sum
     u = jnp.concatenate([us, ws], axis=1)# (s, ud+1)
@@ -201,7 +235,7 @@ def FBPINN_model(all_params, x_batch, takes, model_fns, verbose=True):
     u = jax.ops.segment_sum(u, np_take, indices_are_sorted=False, num_segments=len(x_batch))# (n, ud)
     u = u/npou
 
-    return u, wp, us, ws, us_raw
+    return u, wp, us, ws, us_raw, us_u
 
 def PINN_model(all_params, x_batch, model_fns, verbose=True):
     "Defines PINN model"
@@ -554,6 +588,35 @@ class FBPINNTrainer(_Trainer):
         # logger.debug(jax.tree_util.tree_map(lambda x: str_tensor(x), all_params))
         model_fns = (decomposition.norm_fn, network.network_fn, decomposition.unnorm_fn, decomposition.window_fn)
 
+        # seed supervised pre-training
+        if c.seed_train_epochs > 0 and c.seed_pos is not None:
+            from pinndicmulti.segpinndic.DIC_seed_trainer import train_seeds_fbpinn
+            all_params = train_seeds_fbpinn(
+                all_params,
+                jnp.asarray(c.seed_pos, dtype=jnp.float32),
+                jnp.asarray(c.seed_uv, dtype=jnp.float32),
+                model_fns, decomposition,
+                c.seed_train_epochs,
+                c.seed_lr,
+                c.summary_freq,
+            )
+
+            # predict and visualize seed-fitted displacement field
+            from pinndicmulti.segpinndic.DIC_plot_trainer import plot_seed_prediction
+            mask = all_params["static"]["problem"]["mask"]
+            x_batch_roi = domain.sample_interior(mask)
+            x_batch_roi = jnp.asarray(x_batch_roi, dtype=jnp.float32)
+            m = all_params["static"]["decomposition"]["m"]
+            active = jnp.zeros(m, dtype=int)
+            takes, _, (_, cut_active, _, cut_all, _) = \
+                get_inputs(x_batch_roi, active, all_params, decomposition)
+            trainable_cut = cut_active(all_params["trainable"])
+            static_cut = cut_all(all_params["static"])
+            all_params_cut = {"static": static_cut, "trainable": trainable_cut}
+            u_pred = FBPINN_model(all_params_cut, x_batch_roi, takes, model_fns)[0]
+            label = f"fbpinn_roi{c.roi_id}_pair{c.pair_idx}"
+            plot_seed_prediction(u_pred[:, 0], u_pred[:, 1], mask, c.fig_out_dir, label)
+
         # initialise scheduler
         scheduler = c.scheduler(all_params=all_params, n_steps=c.n_steps, **c.scheduler_kwargs)
 
@@ -601,7 +664,7 @@ class FBPINNTrainer(_Trainer):
                 self._report(i, start0, start1, report_time,
                             all_params, all_opt_states,
                             active, merge_active, active_opt_states, active_params,
-                            lossval)
+                            lossval, decomposition, x_batch_global, jmaps, model_fns)
 
             # take a training step
             lossval, active_opt_states, active_params = update(active_opt_states,
@@ -614,15 +677,68 @@ class FBPINNTrainer(_Trainer):
             self._report(i + 1, start0, start1, report_time,
                         all_params, all_opt_states,
                         active, merge_active, active_opt_states, active_params,
-                        lossval)
+                        lossval, decomposition, x_batch_global, jmaps, model_fns)
 
         # cleanup
         writer.close()
         logger.info(f"[i: {i+1}/{self.c.n_steps}] Training complete")
 
-        # return trained parameters
+        # return trained parameters (final merge)
         all_params["trainable"] = merge_active(active_params, all_params["trainable"])
         all_opt_states = tree_map_dicts(merge_active, active_opt_states, all_opt_states)
+
+        # L-BFGS refinement on all subdomains
+        if c.lbfgs_epochs > 0:
+            logger.info(f"Starting L-BFGS refinement on all subdomains ({c.lbfgs_epochs} steps)...")
+
+            m = all_params["static"]["decomposition"]["m"]
+            active_all = jnp.ones(m, dtype=int)
+
+            x_batch_all = self._get_x_batch(0, active_all, all_params, x_batch_global, decomposition)
+            takes_all, _, (active_all, cut_active_all, cut_fixed_all, cut_all, merge_active_all) = \
+                get_inputs(x_batch_all, active_all, all_params, decomposition)
+
+            active_params_all = cut_active_all(all_params["trainable"])
+            fixed_params_empty = cut_fixed_all(all_params["trainable"])
+            static_params_all = cut_all(all_params["static"])
+
+            static_dynamic, static_static = partition(static_params_all)
+
+            solver = jaxopt.LBFGS(
+                fun=lambda ap, fp, sp_dyn, tk, xb: FBPINN_loss(
+                    ap, fp, combine(sp_dyn, static_static), tk, xb, model_fns, loss_fn),
+                maxiter=1,
+                tol=0.0,
+                maxls=c.lbfgs_maxls,
+                history_size=c.lbfgs_history_size,
+                stepsize=0.0,
+                max_stepsize=c.lbfgs_lr if c.lbfgs_lr > 0 else 1.0,
+                implicit_diff=False,
+            )
+
+            lbfgs_state = solver.init_state(
+                active_params_all, fixed_params_empty, static_dynamic,
+                takes_all, x_batch_all
+            )
+
+            # log initial loss before first step
+            loss_init = lbfgs_state.value
+            logger.info(f"[L-BFGS: 0/{c.lbfgs_epochs}] initial loss: {loss_init.item():.6e}")
+
+            start_lbfgs = time.time()
+            for j in range(c.lbfgs_epochs):
+                active_params_all, lbfgs_state = solver.update(
+                    active_params_all, lbfgs_state,
+                    fixed_params_empty, static_dynamic,
+                    takes_all, x_batch_all
+                )
+                if (j + 1) % c.summary_freq == 0 or j == 0:
+                    lossval_lbfgs = lbfgs_state.value
+                    elapsed = time.time() - start_lbfgs
+                    logger.info(f"[L-BFGS: {j+1}/{c.lbfgs_epochs}] loss: {lossval_lbfgs.item():.6e} | {elapsed:.1f}s")
+
+            all_params["trainable"] = merge_active_all(active_params_all, all_params["trainable"])
+            logger.info(f"L-BFGS refinement done ({time.time()-start_lbfgs:.2f} s)")
 
         u, v, exx, exy, eyy = self._predict(all_params, decomposition, x_batch_global, jmaps, model_fns, dim=dim)
         
@@ -631,7 +747,7 @@ class FBPINNTrainer(_Trainer):
     def _report(self, i, start0, start1, report_time,
                 all_params, all_opt_states,
                 active, merge_active, active_opt_states, active_params,
-                lossval):
+                lossval, decomposition, x_batch_global, jmaps, model_fns):
         "Report results"
 
         c = self.c
@@ -662,8 +778,25 @@ class FBPINNTrainer(_Trainer):
 
                 report_time += time.time()-start2
 
+        if i != 0 and test_ and self.c.test_flag:
+            u, v, exx, exy, eyy = self._predict(all_params, decomposition, x_batch_global, jmaps, model_fns, dim=2)
+            u = np.asarray(u)
+            v = np.asarray(v)
+            exx = np.asarray(exx)
+            exy = np.asarray(exy)
+            eyy = np.asarray(eyy)
+
+            disp_leff = compute_leff(v)
+            strain_leff = compute_leff(eyy)
+            disp_rms = compute_midline_rms(v)
+            strain_rms = compute_midline_rms(eyy)
+
+            self._print_test(i, loss_val,
+                             disp_leff, strain_leff,
+                             disp_rms, strain_rms)
+
         return loss_val, start1, report_time
-    
+
     def _predict(self, all_params, decomposition, x_batch_global, jmaps, model_fns, dim=2):
         if x_batch_global.shape[0] > 512**2:
             batch_size = 512**2
@@ -768,6 +901,31 @@ class PINNTrainer(_Trainer):
         unnorm_fn = lambda u: DIC_networks.unnorm(mu_, sd_, u)
         model_fns = (domain.norm_fn, network.network_fn, unnorm_fn)
 
+        # seed supervised pre-training
+        if c.seed_train_epochs > 0 and c.seed_pos is not None:
+            from pinndicmulti.segpinndic.DIC_seed_trainer import train_seeds_pinn
+            all_params = train_seeds_pinn(
+                all_params,
+                jnp.asarray(c.seed_pos, dtype=jnp.float32),
+                jnp.asarray(c.seed_uv, dtype=jnp.float32),
+                model_fns,
+                c.seed_train_epochs,
+                c.seed_lr,
+                c.summary_freq,
+                smooth_lambda=c.seed_smooth_lambda,
+                smooth_npoints=c.seed_smooth_npoints,
+                key=key,
+            )
+
+            # predict and visualize seed-fitted displacement field
+            from pinndicmulti.segpinndic.DIC_plot_trainer import plot_seed_prediction
+            mask = all_params["static"]["problem"]["mask"]
+            x_batch_roi = domain.sample_interior(mask)
+            x_batch_roi = jnp.asarray(x_batch_roi, dtype=jnp.float32)
+            u_pred, _ = PINN_model(all_params, x_batch_roi, model_fns)
+            label = f"pinn_roi{c.roi_id}_pair{c.pair_idx}"
+            plot_seed_prediction(u_pred[:, 0], u_pred[:, 1], mask, c.fig_out_dir, label)
+
         # common initialisation
         (optimiser, all_opt_states, optimiser_fn, loss_fn, key,
         x_batch_global, jmaps) = _common_train_initialisation(c, key, all_params, problem, domain, dim=dim)
@@ -804,7 +962,7 @@ class PINNTrainer(_Trainer):
                 self._report(i, start0, start1, report_time,
                             all_params, all_opt_states,
                             active_opt_states, active_params,
-                            lossval)
+                            lossval, x_batch_global, jmaps, model_fns)
 
             # take a training step
             lossval, active_opt_states, active_params = update(active_opt_states,
@@ -817,7 +975,47 @@ class PINNTrainer(_Trainer):
             self._report(i + 1, start0, start1, report_time,
                         all_params, all_opt_states,
                         active_opt_states, active_params,
-                        lossval)
+                        lossval, x_batch_global, jmaps, model_fns)
+
+        # L-BFGS refinement phase
+        if c.lbfgs_epochs > 0:
+            logger.info(f"Starting L-BFGS refinement ({c.lbfgs_epochs} steps)...")
+
+            static_dynamic, static_static = partition(static_params)
+
+            solver = jaxopt.LBFGS(
+                fun=lambda params, sp_dyn, xb: PINN_loss(
+                    params, combine(sp_dyn, static_static), xb, model_fns, loss_fn),
+                maxiter=1,
+                tol=0.0,
+                maxls=c.lbfgs_maxls,
+                history_size=c.lbfgs_history_size,
+                stepsize=0.0,
+                max_stepsize=c.lbfgs_lr if c.lbfgs_lr > 0 else 1.0,
+                implicit_diff=False,
+            )
+
+            lbfgs_state = solver.init_state(
+                active_params, static_dynamic, x_batch
+            )
+
+            # log initial loss before first step
+            loss_init = lbfgs_state.value
+            logger.info(f"[L-BFGS: 0/{c.lbfgs_epochs}] initial loss: {loss_init.item():.6e}")
+
+            start_lbfgs = time.time()
+            for j in range(c.lbfgs_epochs):
+                active_params, lbfgs_state = solver.update(
+                    active_params, lbfgs_state,
+                    static_dynamic, x_batch
+                )
+                if (j + 1) % c.summary_freq == 0 or j == 0:
+                    lossval = lbfgs_state.value
+                    elapsed = time.time() - start_lbfgs
+                    logger.info(f"[L-BFGS: {j+1}/{c.lbfgs_epochs}] loss: {lossval.item():.6e} | {elapsed:.1f}s")
+
+            lossval = lbfgs_state.value
+            logger.info(f"L-BFGS refinement done ({time.time()-start_lbfgs:.2f} s)")
 
         # cleanup
         writer.close()
@@ -828,13 +1026,13 @@ class PINNTrainer(_Trainer):
         all_opt_states = active_opt_states
 
         u, v, exx, exy, eyy = self._predict(all_params, x_batch_global, jmaps, model_fns, dim=dim)
-        
+
         return all_params, u, v, exx, exy, eyy, x_batch_global
 
     def _report(self, i, start0, start1, report_time,
                 all_params, all_opt_states,
                 active_opt_states, active_params,
-                lossval):
+                lossval, x_batch_global, jmaps, model_fns):
         "Report results"
 
         c = self.c
@@ -865,8 +1063,25 @@ class PINNTrainer(_Trainer):
 
                 report_time += time.time()-start2
 
+        if i != 0 and test_ and self.c.test_flag:
+            u, v, exx, exy, eyy = self._predict(all_params, x_batch_global, jmaps, model_fns, dim=2)
+            u = np.asarray(u)
+            v = np.asarray(v)
+            exx = np.asarray(exx)
+            exy = np.asarray(exy)
+            eyy = np.asarray(eyy)
+
+            disp_leff = compute_leff(v)
+            strain_leff = compute_leff(eyy)
+            disp_rms = compute_midline_rms(v)
+            strain_rms = compute_midline_rms(eyy)
+
+            self._print_test(i, loss_val,
+                             disp_leff, strain_leff,
+                             disp_rms, strain_rms)
+
         return lossval, start1, report_time
-    
+
     def _predict(self, all_params, x_batch_global, jmaps, model_fns, dim=2):
         if x_batch_global.shape[0] > 512**2:
             batch_size = 512**2
@@ -915,7 +1130,128 @@ class PINNTrainer(_Trainer):
                 u = u.at[ys, xs].set(u_.flatten())
                 v = v.at[ys, xs].set(v_.flatten())
         return u, v, exx, exy, eyy
-            
-            
+
+
+def compute_leff(v):
+    """
+    计算 leff = max(l10, p5)
+
+    Parameters
+    ----------
+    v : ndarray
+        2D 位移场，shape = (Ny, Nx)
+
+    Returns
+    -------
+    float
+        leff value
+    """
+
+    Ny, Nx = v.shape
+
+    # ===== 真值 lambda =====
+    x = np.arange(1, Nx + 1)
+    lambda_gt = 10 + (150 - 10) / 2000 * x
+
+    # ============================================================
+    # 1. l10
+    # ============================================================
+    line_data = v[250, :]   # MATLAB 251 -> Python 250
+
+    ref_val = np.max(np.abs(line_data))
+    threshold = 0.9 * ref_val
+
+    idx = np.where(np.abs(line_data) >= threshold)[0]
+
+    if len(idx) == 0:
+        l10 = np.nan
+    else:
+        l10 = idx[0] + 1   # 转回 MATLAB-style index
+
+    # ============================================================
+    # 2. p5
+    # ============================================================
+    R_all = np.full(Nx, np.nan)
+
+    yy = np.arange(1, Ny + 1)
+
+    for i in range(Nx):
+
+        y = v[:, i]
+
+        if np.any(np.isnan(y)):
+            continue
+
+        y = y - np.mean(y)
+
+        if np.linalg.norm(y) < 1e-6:
+            continue
+
+        lam = lambda_gt[i]
+
+        c = np.cos(2 * np.pi * yy / lam)
+        s = np.sin(2 * np.pi * yy / lam)
+
+        a = np.dot(y, c)
+        b = np.dot(y, s)
+
+        R = np.sqrt(a**2 + b**2) / (
+            np.linalg.norm(y) * np.sqrt(np.sum(c**2))
+        )
+
+        R_all[i] = R
+
+    idx = np.where(R_all > 0.9)[0]
+
+    if len(idx) == 0:
+        p5 = np.nan
+    else:
+        p5 = idx[0] + 1
+
+    # ============================================================
+    # 3. leff
+    # ============================================================
+    if np.isnan(l10) and np.isnan(p5):
+        leff = np.nan
+    elif np.isnan(l10):
+        leff = p5
+    elif np.isnan(p5):
+        leff = l10
+    else:
+        leff = max(l10, p5)
+
+    return leff
+
+
+def compute_midline_rms(v):
+    """
+    计算中线位移 RMS
+
+    对应 MATLAB:
+        line_data_valid = line_data(~isnan(line_data));
+        leff = sqrt(mean(line_data_valid.^2));
+
+    Parameters
+    ----------
+    v : ndarray
+        2D 位移场, shape=(Ny, Nx)
+
+    Returns
+    -------
+    float
+        中线 RMS
+    """
+
+    # MATLAB v(251,:) -> Python v[250,:]
+    line_data = v[250, :]
+
+    line_data_valid = line_data[~np.isnan(line_data)]
+
+    if line_data_valid.size == 0:
+        return np.nan
+
+    rms = np.sqrt(np.mean(line_data_valid ** 2))
+
+    return rms
     
     

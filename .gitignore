@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+case/**/*.png
+case/**/*.mat
+case/**/summaries/
+case/**/calibration/
+case/**/models/

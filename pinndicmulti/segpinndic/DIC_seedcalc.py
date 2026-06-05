@@ -1,5 +1,6 @@
 from pinndicmulti.DIC_importlib import *
 from pinndicmulti.segpinndic.DIC_readImg import BufferManager
+from pinndicmulti.segpinndic.utils.logger import logger
 
 # ============================================
 # 数据结构定义
@@ -50,12 +51,50 @@ class seed_generator:
             # --- 正常情况：K-means 聚类 ---
             kmeans = KMeans(n_clusters=n_points, n_init='auto').fit(pts)
             centers = np.rint(kmeans.cluster_centers_).astype(int)
-            # --- 处理每个中心点 ---
+            # --- 处理每个中心点，含纹理检查 ---
             H, W = mask.shape
             seed_points = []
+            min_std = getattr(self.config, 'min_texture_std', 5)
+            coarse_r = self.config.coarse_subset_radius
+
             for x, y in centers:
-                # 中心点合法（落在 ROI 内）
+                # 边界检查
                 if 0 <= x < W and 0 <= y < H and mask[y, x]:
+                    # 纹理检查：在参考图像 pad 中取子区，计算局部标准差
+                    px = x + coarse_r
+                    py = y + coarse_r
+                    y0 = py - coarse_r
+                    y1 = py + coarse_r + 1
+                    x0 = px - coarse_r
+                    x1 = px + coarse_r + 1
+                    local_patch = BufferManager.refImg_pad[y0:y1, x0:x1]
+                    local_std = float(jnp.std(local_patch))
+                    if local_std >= min_std:
+                        seed_points.append((int(x), int(y)))
+                        continue
+                    # 纹理不足 → 在当前簇内随机搜索更好的位置
+                    cluster_dist = np.sqrt((pts[:, 0] - x)**2 + (pts[:, 1] - y)**2)
+                    cluster_mask = cluster_dist < np.percentile(cluster_dist, 30)
+                    candidates = pts[cluster_mask]
+                    if len(candidates) > 0:
+                        best_std = 0.0
+                        best_pt = None
+                        for cx, cy in candidates[:50]:  # 最多尝试 50 个候选
+                            cpx, cpy = int(cx) + coarse_r, int(cy) + coarse_r
+                            cy0, cy1 = cpy - coarse_r, cpy + coarse_r + 1
+                            cx0, cx1 = cpx - coarse_r, cpx + coarse_r + 1
+                            if (cy0 >= 0 and cx0 >= 0 and
+                                cy1 <= BufferManager.refImg_pad.shape[0] and
+                                cx1 <= BufferManager.refImg_pad.shape[1]):
+                                cp = BufferManager.refImg_pad[cy0:cy1, cx0:cx1]
+                                c_std = float(jnp.std(cp))
+                                if c_std > best_std:
+                                    best_std = c_std
+                                    best_pt = (int(cx), int(cy))
+                        if best_pt is not None and best_std >= min_std:
+                            seed_points.append(best_pt)
+                            continue
+                    # 纹理检查失败，但仍保留（避免种子数不足）
                     seed_points.append((int(x), int(y)))
                     continue
                 # 中心点无效 → 随机从 ROI 内重新采样
@@ -77,10 +116,14 @@ class CalcSeeds:
         self.cutoff_diffnorm = Seed_config.cutoff_diffnorm
         self.max_iterations = Seed_config.max_iterations
         self.lambda_reg = Seed_config.lambda_reg
-        
+        self.corrcoef_threshold = getattr(Seed_config, 'corrcoef_threshold', 2.0)
+        self.min_texture_std  = getattr(Seed_config, 'min_texture_std', 5)
+        self.ncc_threshold    = getattr(Seed_config, 'ncc_threshold', 0.6)
+
         seed_Gen = seed_generator(Seed_config)
         self.seed_points_list = seed_Gen.seed_points_list
         self.method = Seed_config.method
+        self.n_seeds = Seed_config.seeds_number
         
     # ============================================
     # Step 1: 计算单个种子点
@@ -88,73 +131,123 @@ class CalcSeeds:
     def cal_point(self, cy: int, cx: int, num_thread: int = 0):
         # Step 1: 获取矩形感兴趣区域
         coarse_rectroi = self._get_coarse_retroi(cx, cy)
-        
+
+        # Step 1.5: 纹理预检查 — 低纹理区域拒绝匹配
+        roi_mask = coarse_rectroi.mask
+        ref_patch = _extract_region(
+            BufferManager.refImg_pad, coarse_rectroi.x, coarse_rectroi.y,
+            coarse_rectroi.radius
+        )
+        if roi_mask.shape != ref_patch.shape:
+            ref_patch = ref_patch[:roi_mask.shape[0], :roi_mask.shape[1]]
+        n_coarse = jnp.sum(roi_mask)
+        if n_coarse > 0:
+            ref_patch_m = ref_patch.astype(jnp.float32) * roi_mask.astype(jnp.float32)
+            ref_mean = jnp.sum(ref_patch_m) / n_coarse
+            ref_var = jnp.sum((ref_patch_m - ref_mean * roi_mask) ** 2) / n_coarse
+            if jnp.sqrt(jnp.maximum(ref_var, 0.0)) < self.min_texture_std:
+                return None, 0, 0, 'texture'
+
         # Step 2: 整像素匹配 - 获取初值
-        defvector_init, max_cc = initialguess(coarse_rectroi, num_thread)
+        defvector_init, max_cc = initialguess(coarse_rectroi, num_thread, self.ncc_threshold)
         if defvector_init is None:
-            return None, 0, 0
-        
+            return None, 0, 0, 'ncc'
+
         if self.method == "Integer_pixels":
             paramvector = defvector_init + [max_cc]
-            return paramvector, 0, 0
-        
+            return paramvector, 0, 0, 'ok'
+
         # Step 3: 获取矩形感兴趣区域
         fine_rectroi = self._get_fine_retroi(cx, cy)
-        
+
         # Step 4: 亚像素精化
         flage, defvector, corrcoef, diffnorm, num_iterations = iterativesearch_py(
-            defvector_init, fine_rectroi, 
+            defvector_init, fine_rectroi,
             max_iter = self.max_iterations,
             cutoff_diffnorm = self.cutoff_diffnorm,
             lambda_reg = self.lambda_reg
             )
         if flage == FAILED:
-            return None, 0, 0
-        
-        # Step 5: 组织输出 [x, y, u, v, corrcoef]
+            return None, 0, 0, 'icgn'
+
+        # Step 4.5: ZNSSD 相关系数过滤 (NCORR cutoff_corrcoef)
+        if corrcoef > self.corrcoef_threshold:
+            return None, 0, 0, 'corrcoef'
+
+        # Step 5: 组织输出 [u, v, corrcoef]
         paramvector = [defvector[0]] + [defvector[1]] + [corrcoef]
-        return paramvector, diffnorm, num_iterations
+        return paramvector, diffnorm, num_iterations, 'ok'
     
     # ============================================
     # 主入口：处理多个种子点
     # ============================================
     def analyze(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        if self.method == "SIFT":
+            return self._analyze_sift()
+
         # 处理各种子点
         seed_pos_list, seed_uv_list = [], []
         for seed_points in self.seed_points_list:
             valid_seed_pos = []
             valid_seed_uv  = []
+            n_total = len(seed_points)
+            fail_counts = {'texture': 0, 'ncc': 0, 'icgn': 0, 'corrcoef': 0}
+            fail_positions = {'texture': [], 'ncc': [], 'icgn': [], 'corrcoef': []}
             for i, (seed_x, seed_y) in enumerate(
                 tqdm.tqdm(
-                    seed_points, 
-                    desc="Processing seeds", 
-                    total=len(seed_points))
+                    seed_points,
+                    desc="Processing seeds",
+                    total=n_total)
             ):
-                paramvector, diffnorm, num_iterations = self.cal_point(seed_y, seed_x, 0)
-                if paramvector is not None:
+                paramvector, diffnorm, num_iterations, reason = self.cal_point(seed_y, seed_x, 0)
+                if reason == 'ok':
                     u, v = paramvector[0], paramvector[1]
                     valid_seed_pos.append([seed_x, seed_y])
                     valid_seed_uv.append([u, v])
+                else:
+                    fail_counts[reason] += 1
+                    fail_positions[reason].append((int(seed_x), int(seed_y)))
+            n_pass = len(valid_seed_pos)
+            logger.info(
+                f"Seed matching: {n_pass}/{n_total} passed "
+                f"(texture:{fail_counts['texture']} ncc:{fail_counts['ncc']} "
+                f"icgn:{fail_counts['icgn']} corrcoef:{fail_counts['corrcoef']})"
+            )
+            if fail_positions['ncc']:
+                ncc_xy = fail_positions['ncc'][:5]
+                logger.info(f"  NCC fail examples (x,y): {ncc_xy}")
+            if fail_positions['icgn']:
+                icgn_xy = fail_positions['icgn'][:5]
+                logger.info(f"  IC-GN fail examples (x,y): {icgn_xy}")
+            # ---- MAD-based outlier rejection for displacement ----
+            if n_pass >= 8:
+                uv_arr = jnp.asarray(valid_seed_uv, dtype=jnp.float32)
+                median_u = jnp.median(uv_arr[:, 0])
+                median_v = jnp.median(uv_arr[:, 1])
+                mad_u = jnp.median(jnp.abs(uv_arr[:, 0] - median_u))
+                mad_v = jnp.median(jnp.abs(uv_arr[:, 1] - median_v))
+                thresh_u = 4.5 * mad_u + 1e-6
+                thresh_v = 4.5 * mad_v + 1e-6
+                inlier_mask = (
+                    (jnp.abs(uv_arr[:, 0] - median_u) < thresh_u) &
+                    (jnp.abs(uv_arr[:, 1] - median_v) < thresh_v)
+                )
+                n_outliers = jnp.sum(~inlier_mask)
+                if n_outliers > 0:
+                    logger.info(f"  MAD outlier rejection: {n_outliers} outliers removed")
+                valid_seed_pos = [valid_seed_pos[i] for i in range(n_pass)
+                                  if inlier_mask[i]]
+                valid_seed_uv  = [valid_seed_uv[i] for i in range(n_pass)
+                                  if inlier_mask[i]]
+            elif n_pass > 0:
+                logger.warning(
+                    f"  Only {n_pass} seeds passed, skipping outlier rejection"
+                )
             seed_pos = jnp.asarray(valid_seed_pos, dtype=jnp.float32)
-            seed_uv = jnp.asarray(valid_seed_uv,  dtype=jnp.float32) # IQR 去除异常值
-            seed_pos, seed_uv = self.remove_outliers_iqr(seed_pos, seed_uv)
+            seed_uv = jnp.asarray(valid_seed_uv,  dtype=jnp.float32)
             seed_pos_list.append(seed_pos)
             seed_uv_list.append(seed_uv)
         return seed_pos_list, seed_uv_list
-    
-    def remove_outliers_iqr(self, seed_pos, seed_uv, factor=1.5):
-        uv = np.array(seed_uv)
-
-        q1 = np.percentile(uv, 25, axis=0)
-        q3 = np.percentile(uv, 75, axis=0)
-        iqr = q3 - q1
-
-        lower = q1 - factor * iqr
-        upper = q3 + factor * iqr
-
-        mask = np.all((uv >= lower) & (uv <= upper), axis=1)
-
-        return jnp.asarray(seed_pos[mask]), jnp.asarray(seed_uv[mask])
     
     def _get_coarse_retroi(self, x: int, y: int) -> RectangleROI:
         """获取感兴趣区域"""
@@ -215,13 +308,147 @@ class CalcSeeds:
         rectroi.X_flat = xv.reshape(-1)   # (subset_area,)
         rectroi.Y_flat = yv.reshape(-1)
         return rectroi
-        
-    
+
+    def _analyze_sift(self) -> Tuple[List, List]:
+        """SIFT 特征匹配 + 网格优选种子点。
+
+        将 ROI 外接矩形等分为 seeds_number 个网格单元，
+        每个单元内选 SIFT 匹配质量（response / distance）最好的点。
+        """
+        import cv2
+
+        ref_img = np.asarray(BufferManager.refImg, dtype=np.uint8)
+        def_img = np.asarray(BufferManager.defImg, dtype=np.uint8)
+
+        sift = cv2.SIFT_create()
+        kp1, des1 = sift.detectAndCompute(ref_img, None)
+        kp2, des2 = sift.detectAndCompute(def_img, None)
+
+        if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
+            logger.warning("[SIFT] Not enough keypoints")
+            empty = [jnp.zeros((0, 2), dtype=jnp.float32) for _ in BufferManager.mask]
+            return empty, empty
+
+        flann = cv2.FlannBasedMatcher(
+            dict(algorithm=1, trees=5),  # FLANN_INDEX_KDTREE
+            dict(checks=50))
+        raw_matches = flann.knnMatch(des1, des2, k=2)
+
+        good = []
+        for pair in raw_matches:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+        logger.info(f"[SIFT] {len(good)}/{len(raw_matches)} matches passed Lowe's ratio test")
+
+        if len(good) == 0:
+            empty = [jnp.zeros((0, 2), dtype=jnp.float32) for _ in BufferManager.mask]
+            return empty, empty
+
+        # 提取匹配点坐标与质量
+        pts_ref = np.array([kp1[m.queryIdx].pt for m in good])      # (N, 2)
+        pts_def = np.array([kp2[m.trainIdx].pt for m in good])
+        responses = np.array([kp1[m.queryIdx].response for m in good])
+        distances = np.array([m.distance for m in good])
+        quality = responses / (distances + 1e-6)
+
+        uv = pts_def - pts_ref
+
+        seed_pos_list, seed_uv_list = [], []
+        for roi_id, mask in enumerate(BufferManager.mask):
+            mask_np = np.asarray(mask)
+            H, W = mask_np.shape
+            ys_roi, xs_roi = np.where(mask_np)
+            if len(xs_roi) == 0:
+                seed_pos_list.append(jnp.zeros((0, 2), dtype=jnp.float32))
+                seed_uv_list.append(jnp.zeros((0, 2), dtype=jnp.float32))
+                continue
+
+            # 筛选 ROI 内的匹配点
+            pts_int = np.rint(pts_ref).astype(int)
+            inside = np.array([
+                0 <= x < W and 0 <= y < H and mask_np[y, x]
+                for x, y in pts_int
+            ])
+            idx_roi = np.where(inside)[0]
+            if len(idx_roi) == 0:
+                logger.warning(f"[SIFT] No matches inside ROI {roi_id}")
+                seed_pos_list.append(jnp.zeros((0, 2), dtype=jnp.float32))
+                seed_uv_list.append(jnp.zeros((0, 2), dtype=jnp.float32))
+                continue
+
+            pts_roi = pts_ref[idx_roi]
+            uv_roi = uv[idx_roi]
+            qual_roi = quality[idx_roi]
+
+            # 网格划分
+            xmin, xmax = xs_roi.min(), xs_roi.max()
+            ymin, ymax = ys_roi.min(), ys_roi.max()
+            aspect = (xmax - xmin + 1) / (ymax - ymin + 1)
+            n_cols = max(1, int(round(np.sqrt(self.n_seeds * aspect))))
+            n_rows = max(1, int(round(self.n_seeds / n_cols)))
+            cols_edges = np.linspace(xmin, xmax + 1, n_cols + 1)
+            rows_edges = np.linspace(ymin, ymax + 1, n_rows + 1)
+
+            # 每个网格单元选最佳匹配
+            cell_seed_pos = []
+            cell_seed_uv = []
+            for r in range(n_rows):
+                for c in range(n_cols):
+                    x0, x1 = int(cols_edges[c]), int(cols_edges[c + 1])
+                    y0, y1 = int(rows_edges[r]), int(rows_edges[r + 1])
+                    in_cell = (
+                        (pts_roi[:, 0] >= x0) & (pts_roi[:, 0] < x1) &
+                        (pts_roi[:, 1] >= y0) & (pts_roi[:, 1] < y1)
+                    )
+                    idx_cell = np.where(in_cell)[0]
+                    if len(idx_cell) == 0:
+                        continue
+                    best = idx_cell[np.argmax(qual_roi[idx_cell])]
+                    cell_seed_pos.append(pts_roi[best])
+                    cell_seed_uv.append(uv_roi[best])
+
+            if len(cell_seed_pos) < 3:
+                logger.warning(f"[SIFT] ROI {roi_id}: only {len(cell_seed_pos)} cells filled, skip")
+                seed_pos_list.append(jnp.zeros((0, 2), dtype=jnp.float32))
+                seed_uv_list.append(jnp.zeros((0, 2), dtype=jnp.float32))
+                continue
+
+            # MAD 离群值剔除
+            uv_arr = np.array(cell_seed_uv, dtype=np.float32)
+            median_u = np.median(uv_arr[:, 0])
+            median_v = np.median(uv_arr[:, 1])
+            mad_u = np.median(np.abs(uv_arr[:, 0] - median_u))
+            mad_v = np.median(np.abs(uv_arr[:, 1] - median_v))
+            thresh = 4.5
+            inlier = (
+                (np.abs(uv_arr[:, 0] - median_u) < thresh * mad_u + 1e-6) &
+                (np.abs(uv_arr[:, 1] - median_v) < thresh * mad_v + 1e-6)
+            )
+            n_out = np.sum(~inlier)
+            if n_out > 0:
+                logger.info(f"[SIFT] ROI {roi_id}: MAD removed {n_out} outliers")
+
+            cell_seed_pos = [cell_seed_pos[i] for i in range(len(cell_seed_pos)) if inlier[i]]
+            cell_seed_uv = [cell_seed_uv[i] for i in range(len(cell_seed_uv)) if inlier[i]]
+
+            logger.info(f"[SIFT] ROI {roi_id}: {len(cell_seed_pos)} seed points selected "
+                        f"({n_rows}x{n_cols} grid)")
+
+            seed_pos_list.append(jnp.asarray(cell_seed_pos, dtype=jnp.float32))
+            seed_uv_list.append(jnp.asarray(cell_seed_uv, dtype=jnp.float32))
+
+        return seed_pos_list, seed_uv_list
+
+
 # ===================== 辅助函数：图像处理 =====================
 # -------------------------
 # 整像素匹配 - 多尺度NCC
 # -------------------------
-def initialguess(rectroi: RectangleROI, num_thread: int) -> List:
+def initialguess(rectroi: RectangleROI, num_thread: int, ncc_threshold: float = 0.6) -> List:
     # 定义多尺度参数
     reduction_factors = []
     if rectroi.radius // 15 > 0:
@@ -234,7 +461,7 @@ def initialguess(rectroi: RectangleROI, num_thread: int) -> List:
     
     # 迭代多个尺度
     for reduction_factor in reduction_factors:
-        disp_ncc, max_cc = ncc(reduction_factor, disp_prev, rectroi, num_thread)
+        disp_ncc, max_cc = ncc(reduction_factor, disp_prev, rectroi, num_thread, ncc_threshold)
         if disp_ncc is None:
             return None, -1
         # 传递结果给下一次迭代
@@ -246,8 +473,8 @@ def initialguess(rectroi: RectangleROI, num_thread: int) -> List:
 # -------------------------
 # 归一化互相关计算
 # -------------------------
-def ncc(reduction_multigrid: int, disp_prev: List, 
-        rectroi: RectangleROI, num_thread: int) -> List:
+def ncc(reduction_multigrid: int, disp_prev: List,
+        rectroi: RectangleROI, num_thread: int, ncc_threshold: float = 0.6) -> List:
     # -------- 第一部分：获取降采样当前图像 --------
     if disp_prev is None:
         # 第一次迭代：使用整个降采样图像
@@ -287,7 +514,7 @@ def ncc(reduction_multigrid: int, disp_prev: List,
     best_x, best_y, max_ncc = best_ncc_from_map(ncc_map)
     
     # -------- 第四部分：反演位移 --------
-    if max_ncc < 0.2:
+    if max_ncc < ncc_threshold: # 阈值过低，匹配失败
         return None, -1
     else:
         # 从降采样坐标反演到原始像素坐标
@@ -654,7 +881,7 @@ def Seed_match_visualization(refImg, defImg, xy, uv, output_dir, basename, idx):
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    print(f"✅ Visualization saved to: {save_path}")
+    print(f"[OK] Visualization saved to: {save_path}")
 
 if __name__ == "__main__":
     from segpinndic.DIC_config import seed_config_txt, DIC_2D_config_txt

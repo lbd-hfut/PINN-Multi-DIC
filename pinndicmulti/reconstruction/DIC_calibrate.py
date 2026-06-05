@@ -1,177 +1,257 @@
-from pinndicmulti.DIC_importlib import cv2, np, glob, os, Path, savemat
+"""
+Multi-camera self-calibration using COLMAP Structure-from-Motion.
 
-def stereo_calibrate(
-    calibrate_config,
-    DIC_config,
-):
+Uses the first image of each camera folder as calibration input.
+Outputs camera intrinsics, distortion, and poses in .mat format.
+"""
+
+from pinndicmulti.DIC_importlib import cv2, np, os, savemat, Path
+from pinndicmulti.DIC_config import discover_cameras, get_work_subdir
+
+
+def colmap_calibrate_multi_camera(work_dir):
+    """Self-calibrate N cameras using COLMAP SfM on reference images.
+
+    Each camera's first image (work_dir/images/camN/001.jpg) is used
+    as calibration input. COLMAP runs SfM to recover intrinsics and
+    relative poses for all cameras.
+
+    Results saved to work_dir/calibration/cameras.mat:
+        num_cameras: int
+        K_list: list of 3x3 matrices
+        dist_list: list of distortion vectors
+        cam_from_world_R: list of 3x3 rotation matrices
+        cam_from_world_t: list of 3x1 translation vectors
+        P_list: list of 3x4 projection matrices
+        camera_models: list of model name strings
+        camera_params_list: list of raw param vectors
+
+    Parameters
+    ----------
+    work_dir : str
+        Root working directory containing images/ subdirectory.
     """
-    双目标定（支持棋盘格 / 圆点阵）
-    """
-    
-    # ===== 读取参数 =====
-    left_imgs_dir = calibrate_config.calibrate1_dir
-    right_imgs_dir = calibrate_config.calibrate2_dir
-    pattern_type = calibrate_config.pattern_type
-    pattern_size = calibrate_config.pattern_size
-    square_size = calibrate_config.length
-    visualize = calibrate_config.visualize
-    result_dir = os.path.join(DIC_config.output_dir, "calibration")
-    os.makedirs(result_dir, exist_ok=True)
-    calibration_path = DIC_config.calibration_path
+    import pycolmap
 
-    # ===== 世界坐标 =====
-    objp = np.zeros((pattern_size[0]*pattern_size[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:pattern_size[0],
-                           0:pattern_size[1]].T.reshape(-1, 2)
-    objp *= square_size
+    cam_dirs = discover_cameras(work_dir)
+    num_cameras = len(cam_dirs)
+    images_dir = get_work_subdir(work_dir, "images")
+    calib_dir = get_work_subdir(work_dir, "calibration")
+    os.makedirs(calib_dir, exist_ok=True)
 
-    objpoints = []
-    imgpoints_l = []
-    imgpoints_r = []
+    # ----- 1. Collect reference images from each camera -----
+    ref_images = {}  # cam_name -> ref image path
+    for cam_name in cam_dirs:
+        cam_path = os.path.join(images_dir, cam_name)
+        files = sorted([
+            f for f in os.listdir(cam_path)
+            if f.lower().endswith((".bmp", ".png", ".jpg", ".tiff", ".tif"))
+        ])
+        if not files:
+            raise FileNotFoundError(f"No images in {cam_path}")
+        ref_images[cam_name] = os.path.join(cam_path, files[0])
 
-    left_imgs = load_images_from_dir(left_imgs_dir)
-    right_imgs = load_images_from_dir(right_imgs_dir)
+    # ----- 2. Copy ref images to temp dir with camera prefix -----
+    colmap_image_dir = os.path.join(calib_dir, "colmap_calib_images")
+    os.makedirs(colmap_image_dir, exist_ok=True)
 
-    assert len(left_imgs) == len(right_imgs), "左右图数量不一致"
+    for cam_name, ref_path in ref_images.items():
+        basename = os.path.basename(ref_path)
+        new_name = f"{cam_name}_{basename}"
+        new_path = os.path.join(colmap_image_dir, new_name)
+        img = cv2.imread(ref_path)
+        if img is None:
+            raise RuntimeError(f"Failed to read image: {ref_path}")
+        cv2.imwrite(new_path, img)
 
-    # ===== 逐张处理 =====
-    for fl, fr in zip(left_imgs, right_imgs):
-        img_l = cv2.imread(fl)
-        img_r = cv2.imread(fr)
+    # ----- 3. Run COLMAP SfM -----
+    database_path = os.path.join(calib_dir, "colmap.db")
+    sfm_path = os.path.join(calib_dir, "colmap_sfm")
 
-        # 左图
-        if img_l is None:
-            raise ValueError(f"读取失败: {fl}")
-        if len(img_l.shape) == 2:
-            gray_l = img_l  # 已经是灰度图
-        else:
-            gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
+    # Clean previous runs
+    import shutil
+    if os.path.exists(database_path):
+        os.remove(database_path)
+    if os.path.exists(sfm_path):
+        shutil.rmtree(sfm_path)
+    os.makedirs(sfm_path, exist_ok=True)
 
-        # 右图
-        if img_r is None:
-            raise ValueError(f"读取失败: {fr}")
-        if len(img_r.shape) == 2:
-            gray_r = img_r
-        else:
-            gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
+    pycolmap.set_random_seed(0)
 
-        if pattern_type == "chessboard":
-            ret_l, corners_l = cv2.findChessboardCornersSB(gray_l, pattern_size)
-            ret_r, corners_r = cv2.findChessboardCornersSB(gray_r, pattern_size)
-
-        elif pattern_type == "circles":
-            ret_l, corners_l = cv2.findCirclesGrid(gray_l, pattern_size)
-            ret_r, corners_r = cv2.findCirclesGrid(gray_r, pattern_size)
-
-        else:
-            raise ValueError("pattern_type must be chessboard or circles")
-
-        if ret_l and ret_r:
-            objpoints.append(objp)
-            imgpoints_l.append(corners_l)
-            imgpoints_r.append(corners_r)
-
-            if visualize:
-                save_name = os.path.splitext(os.path.basename(fl))[0] + ".png"  # 用左图名字
-                save_path = os.path.join(result_dir, save_name)
-                draw_stereo_matches(img_l, img_r, corners_l, corners_r, save_path)
-
-    cv2.destroyAllWindows()
-
-    # ===== 单目标定 =====
-    ret_l, K1, dist1, rvecs_l, tvecs_l = cv2.calibrateCamera(
-        objpoints, imgpoints_l, gray_l.shape[::-1], None, None
+    # Feature extraction
+    pycolmap.extract_features(
+        database_path, colmap_image_dir,
+        extraction_options={"sift": {"max_num_features": 8192, "first_octave": 0}}
     )
 
-    ret_r, K2, dist2, rvecs_r, tvecs_r = cv2.calibrateCamera(
-        objpoints, imgpoints_r, gray_r.shape[::-1], None, None
+    # Exhaustive matching
+    pycolmap.match_exhaustive(
+        database_path,
+        matching_options={"sift": {"cross_check": True}}
     )
 
-    # ===== 双目标定 =====
-    flags = cv2.CALIB_FIX_INTRINSIC
-
-    ret, K1, dist1, K2, dist2, R, T, E, F = cv2.stereoCalibrate(
-        objpoints,
-        imgpoints_l,
-        imgpoints_r,
-        K1, dist1,
-        K2, dist2,
-        gray_l.shape[::-1],
-        flags=flags
+    # Incremental SfM
+    reconstructions = pycolmap.incremental_mapping(
+        database_path, colmap_image_dir, sfm_path,
+        options={
+            "ba_global_max_refinements": 5,
+            "min_num_matches": 15,
+            "multiple_models": False,
+            "min_model_size": max(3, num_cameras),
+            "min_focal_length_ratio": 0.1,
+            "max_focal_length_ratio": 10.0,
+        }
     )
 
-    # ===== 投影矩阵（关键）=====
-    P1 = K1 @ np.hstack((np.eye(3), np.zeros((3,1))))
-    P2 = K2 @ np.hstack((R, T))
+    if not reconstructions:
+        raise RuntimeError(
+            "COLMAP SfM failed. Ensure calibration images have sufficient "
+            "texture and overlap between camera views."
+        )
 
+    rec = reconstructions[0]
+
+    # ----- 4. Group images by camera and extract params -----
+    cam_image_ids = {cam_name: [] for cam_name in cam_dirs}
+    for image_id, image in rec.images.items():
+        for cam_name in cam_dirs:
+            if image.name.startswith(f"{cam_name}_"):
+                cam_image_ids[cam_name].append(image_id)
+                break
+
+    K_list = []
+    dist_list = []
+    cam_from_world_R = []
+    cam_from_world_t = []
+    P_list = []
+    camera_models = []
+    camera_params_list = []
+
+    for cam_name in cam_dirs:
+        ids = cam_image_ids[cam_name]
+        if not ids:
+            raise RuntimeError(
+                f"Camera {cam_name}: no registered images in COLMAP output. "
+                f"Check that the reference image has sufficient texture."
+            )
+
+        # Get camera intrinsics from the first registered image
+        cam_id = rec.images[ids[0]].camera_id
+        camera = rec.cameras[cam_id]
+
+        K, dist = _extract_camera_params(camera)
+        K_list.append(K)
+        dist_list.append(dist)
+        camera_models.append(str(camera.model))
+        camera_params_list.append(np.array(camera.params, dtype=np.float64))
+
+        # Use the first registered image's pose as this camera's world pose
+        # pycolmap 4.x: cam_from_world is a method, call it to get Rigid3d
+        cfw = rec.images[ids[0]].cam_from_world
+        if callable(cfw):
+            cfw = cfw()
+        cam_from_world_R.append(cfw.rotation.matrix().astype(np.float64))
+        cam_from_world_t.append(cfw.translation.astype(np.float64).reshape(3, 1))
+
+        # Build projection matrix: P = K [R | t]
+        Rt = np.hstack((cam_from_world_R[-1], cam_from_world_t[-1]))
+        P_list.append(K @ Rt)
+
+    # ----- 5. Save results -----
     result = {
-        "K1": K1,
-        "dist1": dist1,
-        "K2": K2,
-        "dist2": dist2,
-        "R": R,
-        "T": T,
-        "P1": P1,
-        "P2": P2,
-        "error": ret
+        "num_cameras": num_cameras,
+        "K_list": np.array(K_list, dtype=object),
+        "dist_list": np.array(dist_list, dtype=object),
+        "cam_from_world_R": np.array(cam_from_world_R, dtype=object),
+        "cam_from_world_t": np.array(cam_from_world_t, dtype=object),
+        "P_list": np.array(P_list, dtype=object),
+        "camera_models": np.array(camera_models, dtype=object),
+        "camera_params_list": np.array(camera_params_list, dtype=object),
+        "cam_names": np.array(cam_dirs, dtype=object),
+        "num_registered_images": rec.num_reg_images(),
     }
-    
-    savemat(calibration_path, result)
-    
+
+    mat_path = os.path.join(calib_dir, "cameras.mat")
+    savemat(mat_path, result)
+
+    print(f"[COLMAP] Multi-camera calibration saved to: {mat_path}")
+    print(f"  Cameras: {num_cameras} ({', '.join(cam_dirs)})")
+    for i, cam_name in enumerate(cam_dirs):
+        print(f"  {cam_name}: model={camera_models[i]}, "
+              f"f={K_list[i][0,0]:.1f}, "
+              f"num_images={len(cam_image_ids[cam_name])}")
+    print(f"  Registered images: {rec.num_reg_images()}/{num_cameras}")
+
+    return result
+
+
+def _extract_camera_params(camera):
+    """Extract K matrix and distortion from COLMAP camera object.
+
+    Returns
+    -------
+    K : np.ndarray (3, 3)
+        Intrinsic matrix
+    dist : np.ndarray (5,)
+        Distortion coefficients [k1, k2, p1, p2, k3]
+    """
+    params = camera.params
+    model = str(camera.model)
+
+    if model in ("SIMPLE_PINHOLE",):
+        f, cx, cy = params[0], params[1], params[2]
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.zeros(5, dtype=np.float64)
+
+    elif model in ("PINHOLE",):
+        fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.zeros(5, dtype=np.float64)
+
+    elif model in ("SIMPLE_RADIAL",):
+        f, cx, cy, k1 = params[0], params[1], params[2], params[3]
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.array([k1, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    elif model in ("RADIAL",):
+        f, cx, cy, k1, k2 = params[0], params[1], params[2], params[3], params[4]
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+        dist = np.array([k1, k2, 0.0, 0.0, 0.0], dtype=np.float64)
+
+    else:
+        # Fallback: use calibration_matrix() with zero distortion
+        K = camera.calibration_matrix().astype(np.float64)
+        dist = np.zeros(5, dtype=np.float64)
+
+    return K, dist
+
+
+# ============================================================
+# Legacy compatibility wrappers
+# ============================================================
+
+def stereo_calibrate(calibrate_config, DIC_config):
+    """Legacy wrapper: calls colmap_calibrate_multi_camera with work_dir.
+
+    Kept for backward compatibility with old config format that had
+    calibrate1_dir, calibrate2_dir, output_dir, calibration_path keys.
+    """
+    # Extract work_dir from DIC_config
+    work_dir = getattr(DIC_config, 'work_dir', None)
+    if work_dir is None:
+        # Fallback: try to derive from calibrate_config
+        raise ValueError(
+            "Legacy config format no longer supported. "
+            "Please use the new work_dir-based config."
+        )
+    return colmap_calibrate_multi_camera(work_dir)
+
+
 def load_images_from_dir(img_dir):
+    """Load sorted image file paths from directory."""
     extensions = ["*.bmp", "*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"]
     img_dir = Path(img_dir)
     files = []
     for ext in extensions:
         files.extend(img_dir.glob(ext))
     return sorted([str(f) for f in files])
-
-def draw_stereo_matches(img_l, img_r, corners_l, corners_r, save_path=None):
-    """
-    将左右图拼接，并绘制特征点连线
-    """
-    # 转为 (N,2)
-    pts_l = corners_l.reshape(-1, 2)
-    pts_r = corners_r.reshape(-1, 2)
-
-    # 拼接图像（横向）
-    h1, w1 = img_l.shape[:2]
-    h2, w2 = img_r.shape[:2]
-
-    h = max(h1, h2)
-    canvas = np.zeros((h, w1 + w2, 3), dtype=np.uint8)
-
-    canvas[:h1, :w1] = img_l
-    canvas[:h2, w1:w1+w2] = img_r
-
-    # 画点和连线
-    for (x1, y1), (x2, y2) in zip(pts_l, pts_r):
-        pt1 = (int(x1), int(y1))
-        pt2 = (int(x2) + w1, int(y2))  # 右图要加偏移
-
-        color = tuple(np.random.randint(0, 255, 3).tolist())
-
-        cv2.circle(canvas, pt1, 3, color, -1)
-        cv2.circle(canvas, pt2, 3, color, -1)
-        cv2.line(canvas, pt1, pt2, color, 1)
-
-    # 显示
-    # cv2.imshow("stereo matches", canvas)
-    # cv2.waitKey(200)
-
-    # 保存
-    if save_path is not None:
-        cv2.imwrite(save_path, canvas)
-
-    return canvas
-
-if __name__ == "__main__":
-    from pinndicmulti.DIC_config import DIC_3D_config_txt, calibrate_config_txt
-    DIC_config = DIC_3D_config_txt("./config/PINN-DIC-3D.txt", verbose=False)
-    calibrate_config = calibrate_config_txt(
-        "./config/Calibration_Configuration.txt", verbose=False)
-    
-    stereo_calibrate(
-        calibrate_config,
-        DIC_config,
-    )

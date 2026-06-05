@@ -337,8 +337,189 @@ class ImgDataset3D:
         
     
     
+def _find_mask(work_dir, mask_path=None):
+    """Find mask file: explicit path > work_dir/*.{png,bmp,jpg} > work_dir/image/*."""
+    if mask_path and os.path.exists(mask_path):
+        return mask_path
+    for ext in (".png", ".bmp", ".jpg"):
+        for loc in (work_dir, os.path.join(work_dir, "image")):
+            p = os.path.join(loc, f"mask{ext}")
+            if os.path.exists(p):
+                return p
+    raise FileNotFoundError(
+        f"Mask file not found. Place mask.png/mask.bmp in work_dir/ "
+        f"or work_dir/image/, or specify mask_path in config."
+    )
+
+
+class MultiCamDataset:
+    """Multi-camera image dataset for PINN-Multi-DIC.
+
+    Auto-discovers N camera folders under work_dir/images/.
+    Each camera folder contains: first image = reference, rest = deformed frames.
+    The first image of each camera also serves as COLMAP calibration input.
+    """
+
+    def __init__(self, work_dir, Seed_config, mask_path=None, mask_camera="1"):
+        from pinndicmulti.DIC_config import discover_cameras
+
+        cam_dirs = discover_cameras(work_dir)
+        self.num_cameras = len(cam_dirs)
+
+        # Reorder: mask_camera → index 0 (primary reference)
+        mask_cam = str(mask_camera)
+        if mask_cam not in cam_dirs:
+            raise ValueError(
+                f"mask_camera='{mask_cam}' not found among camera folders: {cam_dirs}. "
+                f"Set mask_camera to the folder name whose reference image the mask aligns with."
+            )
+        cam_dirs.remove(mask_cam)
+        cam_dirs = [mask_cam] + cam_dirs  # mask_camera first
+        self.cam_names = cam_dirs
+        self.ref_cam_name = mask_cam
+
+        images_dir = os.path.join(work_dir, "images")
+        self.coarse_subset_radius = Seed_config.coarse_subset_radius
+
+        # Load all camera image files
+        self.cam_ref_files = []      # ref image path per camera
+        self.cam_def_files = []      # list of deformed image paths per camera
+
+        for cam_name in cam_dirs:
+            cam_path = os.path.join(images_dir, cam_name)
+            files = sorted([
+                os.path.join(cam_path, f) for f in os.listdir(cam_path)
+                if f.lower().endswith((".bmp", ".png", ".jpg", ".tiff", ".tif"))
+            ])
+            if len(files) < 2:
+                raise ValueError(
+                    f"Camera {cam_name} needs at least 2 images "
+                    f"(1 ref + 1 deformed), found {len(files)}"
+                )
+            self.cam_ref_files.append(files[0])    # first = ref
+            self.cam_def_files.append(files[1:])    # rest = deformed
+
+        # Verify all cameras have same number of deformed frames
+        num_def_frames = [len(defs) for defs in self.cam_def_files]
+        if len(set(num_def_frames)) > 1:
+            raise ValueError(
+                f"All cameras must have the same number of deformed frames. "
+                f"Got: {dict(zip(cam_dirs, num_def_frames))}"
+            )
+        self.num_frames = num_def_frames[0]
+
+        # Load mask: explicit path > work_dir/*.{png,bmp,jpg} > work_dir/image/*
+        mask_file = _find_mask(work_dir, mask_path)
+        logger.info(f"Using mask: {mask_file}")
+        mask_bin = MultiCamDataset.open_image(mask_file) > 0
+        labeled, num_labels = label(mask_bin)
+        if num_labels == 0:
+            raise RuntimeError("Mask has no foreground pixels!")
+
+        ROI_list, ROI_list_pad = [], []
+        for comp_id in range(1, num_labels + 1):
+            roi_i = (labeled == comp_id)
+            roi_i = jnp.array(roi_i, dtype=jnp.bool_)
+            roi_i_pad = jnp.pad(
+                roi_i, pad_width=self.coarse_subset_radius,
+                mode='constant', constant_values=False
+            )
+            ROI_list.append(roi_i)
+            ROI_list_pad.append(roi_i_pad)
+
+        BufferManager.mask = ROI_list
+        BufferManager.mask_pad = ROI_list_pad
+
+        # Load primary reference camera (mask_camera) as the initial reference
+        BufferManager.refImg = self.open_image(self.cam_ref_files[0])
+        BufferManager.refImg_pad = jnp.pad(
+            BufferManager.refImg, pad_width=self.coarse_subset_radius,
+            mode='constant', constant_values=False
+        )
+
+        logger.info("precomputing seed buffers")
+        build_seed_buffer_jax(BufferManager.refImg, np.asarray(mask_bin), degree=5)
+
+        self.spline_degree = 5
+        logger.info(
+            f"MultiCamDataset: {self.num_cameras} cameras, "
+            f"{self.num_frames} frames, {num_labels} ROIs"
+        )
+
+    def __len__(self):
+        return self.num_cameras * self.num_frames
+
+    def get_image(self, cam_idx, frame_idx):
+        """Load deformed image for camera cam_idx at time frame_idx."""
+        def_file = self.cam_def_files[cam_idx][frame_idx]
+        BufferManager.defImg = self.open_image(def_file)
+        BufferManager.defImg_pad = jnp.pad(
+            BufferManager.defImg, pad_width=self.coarse_subset_radius,
+            mode='constant', constant_values=False
+        )
+        build_DIC_buffer_jax(BufferManager.defImg, degree=self.spline_degree)
+
+    def set_ref_image(self, cam_idx):
+        """Switch BufferManager to use camera cam_idx as reference."""
+        BufferManager.refImg = self.open_image(self.cam_ref_files[cam_idx])
+        BufferManager.refImg_pad = jnp.pad(
+            BufferManager.refImg, pad_width=self.coarse_subset_radius,
+            mode='constant', constant_values=False
+        )
+
+    @staticmethod
+    def open_image(name):
+        img = Image.open(name).convert("L")
+        return jnp.array(img, dtype=jnp.float32)
+
+    def set_mask(self, mask_list):
+        """Replace BufferManager.mask (e.g. with a warped mask for this camera)."""
+        pad = self.coarse_subset_radius
+        BufferManager.mask = [jnp.asarray(m, dtype=jnp.bool_) for m in mask_list]
+        BufferManager.mask_pad = [
+            jnp.pad(m, pad_width=pad, mode='constant', constant_values=False)
+            for m in BufferManager.mask
+        ]
+
+
+def warp_mask_via_disparity(mask_0, u_disp, v_disp, shape):
+    """Forward-warp a reference-camera mask to another view using disparity.
+
+    Args:
+        mask_0: (H, W) binary array — mask in reference camera
+        u_disp: (H, W) u displacement from ref camera to target camera
+        v_disp: (H, W) v displacement from ref camera to target camera
+        shape: (H, W) target image shape
+
+    Returns:
+        warped_mask: (H, W) binary array
+    """
+    from scipy.ndimage import binary_dilation
+
+    H, W = shape
+    ys, xs = np.where(mask_0)
+    xj = xs + u_disp[ys, xs]
+    yj = ys + v_disp[ys, xs]
+
+    xj_int = np.round(xj).astype(int)
+    yj_int = np.round(yj).astype(int)
+
+    valid = (xj_int >= 0) & (xj_int < W) & (yj_int >= 0) & (yj_int < H)
+    xj_int = xj_int[valid]
+    yj_int = yj_int[valid]
+
+    if len(xj_int) == 0:
+        return np.zeros(shape, dtype=bool)
+
+    mask_warped = np.zeros(shape, dtype=bool)
+    mask_warped[yj_int, xj_int] = True
+    mask_warped = binary_dilation(mask_warped, iterations=3)
+
+    return mask_warped
+
+
 if __name__ == "__main__":
-    
+
     from segpinndic.DIC_config import seed_config_txt, DIC_2D_config_txt
     seed_config_path = "./config/Seed_Configuration.txt"
     dic_config_path = "./config/PINN-DIC-2D.txt"
