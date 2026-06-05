@@ -221,3 +221,4 @@ case/**/*.mat
 case/**/summaries/
 case/**/calibration/
 case/**/models/
+scripts/
