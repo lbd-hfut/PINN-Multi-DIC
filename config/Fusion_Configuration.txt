@@ -1,0 +1,67 @@
+############################################
+#  网络结构（可从 DIC_networks.py 中选）
+#  AdaptiveFCN / FCN / SIREN / AdaptiveSIREN / FourierNet / ResNet / AdaptiveResNet
+############################################
+
+# network: 网络架构
+AdaptiveFCN
+
+# hidden_layers: 隐藏层层数
+3
+
+# hidden_neurons: 每层神经元数
+32
+
+# output_mode: 输出模式 (single=一个网络输出XYZ, triple=三个独立网络各输出一个分量)
+triple
+
+# fourier_mapping_size: 傅里叶特征维度（仅 FourierNet 有效）
+64
+
+# fourier_sigma_list: 傅里叶多尺度频率列表（仅 FourierNet 有效）
+[1, 4, 8, 16]
+
+############################################
+#  训练参数
+############################################
+
+# adam_epochs: Adam 训练轮数
+1000
+
+# adam_lr: Adam 学习率
+0.001
+
+# lbfgs_epochs: L-BFGS 精调步数（0 表示跳过，默认不启用）
+0
+
+# lbfgs_history_size: L-BFGS 历史长度
+10
+
+# lbfgs_maxls: L-BFGS 最大线搜索次数
+15
+
+# lbfgs_lr: L-BFGS 最大步长
+1.0
+
+# lbfgs_tol: L-BFGS 收敛容差（0 表示不提前停止）
+0.0
+
+############################################
+#  数据处理
+############################################
+
+# prefilter_outliers: 是否对每组三角化结果做异常值预剔除 (median → threshold 外不参与训练)
+True
+
+# outlier_threshold_sigma: 异常值剔除阈值（与 median 偏差超过 N×σ 的点被剔除）
+3.0
+
+############################################
+#  输出控制
+############################################
+
+# summary_freq: 打印 loss 频率（epoch）
+100
+
+# save_figures: 是否保存训练 loss 曲线
+True

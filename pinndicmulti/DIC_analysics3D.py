@@ -10,12 +10,12 @@ Efficient two-stage approach:
 from pinndicmulti.DIC_importlib import os, jax, jnp, np, savemat
 
 from pinndicmulti.DIC_config import (
-    seed_config_txt, DIC_3D_config_txt,
+    seed_config_txt, DIC_3D_config_txt, fusion_config_txt,
     discover_cameras, get_work_subdir,
 )
 from pinndicmulti.reconstruction.DIC_calibrate import colmap_calibrate_multi_camera
 from pinndicmulti.reconstruction.DIC_triangulation import triangulate_all_pairs
-from pinndicmulti.reconstruction.DIC_fusion import fuse_pairwise_reconstructions
+from pinndicmulti.reconstruction.DIC_fusion_nn import FusionTrainer
 from pinndicmulti.reconstruction.DIC_strain3Dcalc import DIC3D_Strain_from_Displacement
 from pinndicmulti.segpinndic.DIC_readImg import BufferManager, MultiCamDataset
 from pinndicmulti.segpinndic.DIC_seedcalc import CalcSeeds, Seed_match_visualization
@@ -137,12 +137,14 @@ def _setup_seed_uv(DIC_config, Seed_config, N_roi):
 def main(
     dic_config_path="./config/PINN-DIC-Mutil3D.txt",
     seed_config_path="./config/Seed_Configuration.txt",
+    fusion_config_path="./config/Fusion_Configuration.txt",
 ):
     # ==============================================================
     # 1. Parse configuration
     # ==============================================================
     DIC_config = DIC_3D_config_txt(dic_config_path, verbose=False)
     Seed_config = seed_config_txt(seed_config_path, verbose=False)
+    fusion_config = fusion_config_txt(fusion_config_path, verbose=False)
     work_dir = DIC_config.work_dir
     logger.info(f"Work directory: {work_dir}")
 
@@ -279,7 +281,15 @@ def main(
 
     # Triangulate → 3D reference surface
     logger.info("Triangulating reference surface...")
-    pts3D_ref = triangulate_all_pairs(calib, ref_matched_pts, coords)
+    _, pts3D_all_ref = triangulate_all_pairs(calib, ref_matched_pts, coords,
+                                             return_raw=True)
+
+    # Neural network fusion
+    logger.info(f"Fusing reference surface ({len(pts3D_all_ref)} pairs, "
+                f"{coords.shape[0]} points)...")
+    fusion_ref = FusionTrainer(fusion_config)
+    key_ref = jax.random.PRNGKey(42)
+    pts3D_ref = fusion_ref.train(coords, pts3D_all_ref, key=key_ref)
 
     Xref = np.empty((img_h, img_w), dtype=np.float32); Xref.fill(np.nan)
     Yref = np.empty((img_h, img_w), dtype=np.float32); Yref.fill(np.nan)
@@ -382,7 +392,15 @@ def main(
                 f"v [{np.min(v_roi):.2f}, {np.max(v_roi):.2f}]")
 
         # --- Triangulate current frame from all cameras ---
-        pts3D_t = triangulate_all_pairs(calib, frame_matched_pts, coords)
+        _, pts3D_all_t = triangulate_all_pairs(calib, frame_matched_pts, coords,
+                                                return_raw=True)
+
+        # Neural network fusion
+        logger.info(f"  Fusing frame {frame_idx+1} "
+                    f"({len(pts3D_all_t)} pairs, {coords.shape[0]} points)...")
+        fusion_frame = FusionTrainer(fusion_config)
+        key_t = jax.random.PRNGKey(43 + frame_idx)
+        pts3D_t = fusion_frame.train(coords, pts3D_all_t, key=key_t)
 
         # --- 3D displacement ---
         U_roi = pts3D_t[:, 0] - pts3D_ref[:, 0]

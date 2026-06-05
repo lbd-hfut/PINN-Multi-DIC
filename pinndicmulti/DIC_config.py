@@ -298,12 +298,85 @@ def DIC_3D_config_txt(path, required_keys=ALL_KEYS_3D, verbose=True):
     return SimpleNamespace(**config)
 
 
+ALL_KEYS_FUSION = [
+    "network", "hidden_layers", "hidden_neurons", "output_mode",
+    "fourier_mapping_size", "fourier_sigma_list",
+    "adam_epochs", "adam_lr",
+    "lbfgs_epochs", "lbfgs_history_size", "lbfgs_maxls", "lbfgs_lr", "lbfgs_tol",
+    "prefilter_outliers", "outlier_threshold_sigma",
+    "summary_freq", "save_figures",
+]
+
+# ============================================
+# 读取多视角融合配置文件
+# ============================================
+def fusion_config_txt(path, required_keys=ALL_KEYS_FUSION, verbose=True):
+    """
+    Parse fusion config txt file.
+
+    Supported sections:
+    - Network: network, hidden_layers, hidden_neurons, output_mode, fourier_*
+    - Training: adam_epochs, adam_lr, lbfgs_*
+    - Data: prefilter_outliers, outlier_threshold_sigma
+    - Output: summary_freq, save_figures
+    """
+    config = {}
+    current_key = None
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                if ":" in line:
+                    parts = line[1:].split(":", 1)
+                    current_key = parts[0].strip()
+                    if verbose:
+                        print(f"[line {lineno}] ⏳ Detected key '{current_key}' -> waiting for value...")
+                else:
+                    current_key = None
+                    if verbose:
+                        print(f"[line {lineno}] 📝 Comment ignored: {raw_line.strip()}")
+                continue
+            if current_key is None:
+                if verbose:
+                    print(f"[line {lineno}] ⚠️ Value without key ignored: {line}")
+                continue
+            raw_value = line
+            if raw_value.lower() == 'null':
+                value = None
+            elif raw_value.lower() == 'true':
+                value = True
+            elif raw_value.lower() == 'false':
+                value = False
+            else:
+                try:
+                    value = ast.literal_eval(raw_value)
+                except Exception:
+                    value = raw_value
+            config[current_key] = value
+            if verbose:
+                print(f"[line {lineno}] ✅ Loaded key '{current_key}' = {value}")
+            current_key = None
+
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        raise KeyError(f"Missing required fusion config keys: {missing}")
+
+    if verbose:
+        print("\n=== ✅ Fusion configuration loaded successfully ===")
+        for k, v in config.items():
+            print(f"  {k}: {v}")
+
+    return SimpleNamespace(**config)
+
+
 if __name__ == "__main__":
     # 测试读取配置文件
     # config = DIC_2D_config_txt("./config/PINN-DIC-2D.txt")
     # for i in range(5):
     #     print()
-        
+
     # config = DIC_3D_config_txt("./config/PINN-DIC-3D.txt")
-    
+
     config = calibrate_config_txt("./config/Calibration_Configuration.txt")

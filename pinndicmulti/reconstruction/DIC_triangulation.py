@@ -176,7 +176,8 @@ def triangulate_pair(K_i, K_j, dist_i, dist_j, R_i, t_i, R_j, t_j, pts2D_i, pts2
     return pts3D
 
 
-def triangulate_all_pairs(calib, matched_pts_per_camera, roi_coords):
+def triangulate_all_pairs(calib, matched_pts_per_camera, roi_coords,
+                          return_raw=False):
     """Triangulate 3D points from all camera pairs and return merged cloud.
 
     Uses camera 0 as reference. For each pair (0, j), triangulates
@@ -192,11 +193,15 @@ def triangulate_all_pairs(calib, matched_pts_per_camera, roi_coords):
         Points are in pixel coordinates relative to camera 0's reference image.
     roi_coords : ndarray (N, 2)
         Reference pixel coordinates in camera 0 (x, y).
+    return_raw : bool
+        If True, also return the list of raw pairwise point clouds.
 
     Returns
     -------
     pts3D_merged : ndarray (N, 3)
         Fused 3D point cloud in world coordinates.
+    pts3D_all : list of ndarray, only if return_raw=True
+        Raw pairwise triangulation results (num_cameras-1 groups of (N,3)).
     """
     num_cameras = calib["num_cameras"]
     K_list = calib["K_list"]
@@ -224,10 +229,13 @@ def triangulate_all_pairs(calib, matched_pts_per_camera, roi_coords):
 
     # Simple fusion: average all pairwise reconstructions
     if len(pts3D_all) == 1:
-        return pts3D_all[0]
+        pts3D_merged = pts3D_all[0]
+    else:
+        pts3D_stacked = np.stack(pts3D_all, axis=0)  # (num_pairs, N, 3)
+        pts3D_merged = np.mean(pts3D_stacked, axis=0)
 
-    pts3D_stacked = np.stack(pts3D_all, axis=0)  # (num_pairs, N, 3)
-    pts3D_merged = np.mean(pts3D_stacked, axis=0)
+    if return_raw:
+        return pts3D_merged, pts3D_all
     return pts3D_merged
 
 
