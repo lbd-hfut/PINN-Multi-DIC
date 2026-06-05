@@ -30,7 +30,7 @@
          cam0_ref ←→ cam1_ref  跨视角 DIC ──→ 视差
          cam0_ref ←→ cam2_ref  跨视角 DIC ──→ 视差
                         ↓
-                  三角化 → X₀, Y₀, Z₀  (参考表面)
+               Pairwise 三角化 (M 组) → NN 融合 → X₀, Y₀, Z₀
 
  ═══════════════════════════════════════════════════
  STAGE 2: Intra-view temporal DIC (per camera, per frame)
@@ -45,7 +45,7 @@
    (x, y) ──→ (x+u₀ᵗ, y+v₀ᵗ)  in cam0
    (xⱼ, yⱼ) ──→ (xⱼ+uⱼᵗ, yⱼ+vⱼᵗ)  in camⱼ
                     ↓
-              三角化 → Xt, Yt, Zt
+              三角化 → NN 融合 → Xt, Yt, Zt
               U,V,W = Xt - X₀
 ```
 
@@ -56,6 +56,7 @@
 - **N-camera support** — Auto-discovers camera folders under `work_dir/images/`, no hardcoded camera count
 - **COLMAP self-calibration** — No calibration targets needed; uses reference images for automatic SfM-based calibration
 - **Three-stage efficient pipeline** — Cross-view DIC runs once (reference frame); temporal DIC within each camera is fast and parallelizable
+- **NN-based multi-view fusion** — Coordinate MLP fits a smooth 3D surface from pairwise triangulations, with automatic outlier rejection and prefiltering
 - **Full-field 3D output** — Displacement (U, V, W) and strain (exx, eyy, ezz, exy, exz, eyz) for every frame
 - **PINN-based DIC engine** — Physics-informed neural networks for continuous displacement fields with FBPINN domain decomposition
 - **Multiple network architectures** — AdaptiveFCN, AdaptiveSIREN, AdaptiveResNet, FourierNet
@@ -145,6 +146,7 @@ from pinndicmulti.DIC_analysics3D import main
 main(
     dic_config_path="./config/PINN-DIC-Mutil3D.txt",
     seed_config_path="./config/Seed_Configuration.txt",
+    fusion_config_path="./config/Fusion_Configuration.txt",
 )
 ```
 
@@ -163,6 +165,10 @@ my_experiment/
 ├── summaries/                     # TensorBoard logs
 ├── models/                        # Model checkpoints (.jax)
 └── figs/                          # Visualization figures
+    ├── 3D/                        # 3D surface plots (reference + per-frame deformed)
+    ├── 2D/                        # 2D displacement & strain heatmaps
+    ├── Disparity/                 # Per-pair DIC disparity field heatmaps
+    └── seed/                      # Seed matching diagnostics
 ```
 
 ---
@@ -213,6 +219,42 @@ my_experiment/
 | `lambda_reg` | `float` | `0.0` | IC-GN regularization |
 | `plot_seed_flage` | `bool` | `True` | Enable seed match visualization |
 
+### Fusion Config (`config/Fusion_Configuration.txt`)
+
+Controls the coordinate-MLP that fuses multiple pairwise triangulation results into a smooth 3D surface. The network maps normalized ROI pixel coordinates `(x, y)` to 3D world coordinates `(X, Y, Z)`, trained on all pairwise triangulations with automatic outlier rejection.
+
+**Network**
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `network` | `str` | `AdaptiveFCN` | Architecture from `DIC_networks.py` |
+| `hidden_layers` | `int` | `3` | Number of hidden layers |
+| `hidden_neurons` | `int` | `32` | Neurons per hidden layer |
+| `output_mode` | `str` | `single` | `single` = one net for XYZ, `triple` = three independent nets |
+| `fourier_mapping_size` | `int` | `64` | Fourier feature dim (FourierNet only) |
+| `fourier_sigma_list` | `list[float]` | `[1,4,8,16]` | Multi-scale frequencies (FourierNet only) |
+
+**Training**
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `adam_epochs` | `int` | `1000` | Adam training epochs |
+| `adam_lr` | `float` | `0.001` | Adam learning rate |
+| `lbfgs_epochs` | `int` | `0` | L-BFGS refinement steps (0 = skip) |
+| `lbfgs_history_size` | `int` | `10` | L-BFGS history length |
+| `lbfgs_maxls` | `int` | `15` | L-BFGS max line search iterations |
+| `lbfgs_lr` | `float` | `1.0` | L-BFGS max step size |
+| `lbfgs_tol` | `float` | `0.0` | L-BFGS convergence tolerance (0 = no early stop) |
+
+**Data**
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `prefilter_outliers` | `bool` | `True` | Median-based outlier rejection before training |
+| `outlier_threshold_sigma` | `float` | `3.0` | Rejection threshold (×σ from median) |
+| `summary_freq` | `int` | `100` | Loss print frequency (epochs) |
+| `save_figures` | `bool` | `True` | Save training loss curve |
+
 ---
 
 ## Project Structure
@@ -239,7 +281,8 @@ pinndicmulti/
 └── reconstruction/               # 3D reconstruction pipeline
     ├── DIC_calibrate.py          # COLMAP multi-camera self-calibration
     ├── DIC_triangulation.py      # Pairwise + multi-camera triangulation
-    ├── DIC_fusion.py             # Point cloud fusion (average/median/weighted)
+    ├── DIC_fusion_nn.py          # NN-based multi-view surface fusion (FusionTrainer)
+    ├── DIC_fusion.py             # Point cloud fusion (average/median/robust)
     └── DIC_strain3Dcalc.py       # 3D strain via local least-squares
 ```
 
