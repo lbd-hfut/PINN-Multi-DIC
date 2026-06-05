@@ -27,16 +27,16 @@
  ═══════════════════════════════════════════════════
  STAGE 1: Cross-view DIC (reference frame only, once)
  ═══════════════════════════════════════════════════
-         cam0_ref ←→ cam1_ref  跨视角 DIC ──→ 视差
-         cam0_ref ←→ cam2_ref  跨视角 DIC ──→ 视差
+         cam0_ref ←→ cam1_ref  cross-view DIC ──→ disparity
+         cam0_ref ←→ cam2_ref  cross-view DIC ──→ disparity
                         ↓
-               Pairwise 三角化 (M 组) → NN 融合 → X₀, Y₀, Z₀
+          Pairwise triangulation (M pairs) → NN fusion → X₀, Y₀, Z₀
 
  ═══════════════════════════════════════════════════
  STAGE 2: Intra-view temporal DIC (per camera, per frame)
  ═══════════════════════════════════════════════════
-   cam0: ref→def₁, ref→def₂, ...  时序 DIC → u₀ᵗ, v₀ᵗ
-   cam1: ref→def₁, ref→def₂, ...  时序 DIC → u₁ᵗ, v₁ᵗ
+   cam0: ref→def₁, ref→def₂, ...  temporal DIC → u₀ᵗ, v₀ᵗ
+   cam1: ref→def₁, ref→def₂, ...  temporal DIC → u₁ᵗ, v₁ᵗ
    ...
 
  ═══════════════════════════════════════════════════
@@ -45,8 +45,8 @@
    (x, y) ──→ (x+u₀ᵗ, y+v₀ᵗ)  in cam0
    (xⱼ, yⱼ) ──→ (xⱼ+uⱼᵗ, yⱼ+vⱼᵗ)  in camⱼ
                     ↓
-              三角化 → NN 融合 → Xt, Yt, Zt
-              U,V,W = Xt - X₀
+          Triangulation → NN fusion → Xt, Yt, Zt
+          U,V,W = Xt - X₀
 ```
 
 ---
